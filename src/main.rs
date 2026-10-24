@@ -1,3 +1,7 @@
+mod analysis;
+mod models;
+mod platform;
+mod scanner;
 mod ui;
 
 use gpui_kit::*;
@@ -5,6 +9,12 @@ use gpui_kit::*;
 fn main() {
     application().with_assets(assets::Assets).run(|cx| {
         init(cx);
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
 
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -19,7 +29,7 @@ fn main() {
             ..Default::default()
         };
 
-        open_window(options, cx, |_, cx| cx.new(|_| ui::AppView))
+        open_window(options, cx, |_, cx| cx.new(ui::AppView::new))
             .expect("Failed to open the application window");
         cx.activate(true);
     });

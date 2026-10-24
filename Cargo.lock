@@ -834,6 +834,8 @@ name = "clean"
 version = "0.1.0"
 dependencies = [
  "gpui-kit",
+ "libc",
+ "rustix",
 ]
 
 [[package]]
