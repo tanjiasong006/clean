@@ -1,0 +1,9 @@
+[package]
+name = "clean"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A macOS-first disk space analyzer built with GPUI Kit"
+
+[dependencies]
+gpui-kit = "=0.8.0"
