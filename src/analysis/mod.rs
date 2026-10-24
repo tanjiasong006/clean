@@ -1,3 +1,7 @@
+mod category;
+
+pub use category::Category;
+
 use std::cmp::Ordering;
 
 use crate::models::{EntryKind, NodeChange, NodeId, ScanResults};

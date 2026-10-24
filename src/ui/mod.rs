@@ -20,7 +20,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::{
-    analysis::{DirectoryIndex, LARGE_FILE_FLOOR, LargeFileIndex, format_bytes},
+    analysis::{Category, DirectoryIndex, LARGE_FILE_FLOOR, LargeFileIndex, format_bytes},
     models::{DiskSpace, EntryKind, NodeId, ScanEvent, ScanIssue, ScanResults, ScanState},
     platform,
     scanner::ScanJob,
@@ -30,11 +30,7 @@ mod appearance;
 mod design;
 
 use appearance::Appearance;
-use design::{Palette, button, radius, type_size};
-
-const ROW_HEIGHT: f32 = 44.0;
-const SMALL_ROW_HEIGHT: f32 = 30.0;
-const INSPECTOR_WIDTH: f32 = 300.0;
+use design::{Palette, button, layout, radius, type_size};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Page {
@@ -711,50 +707,26 @@ impl AppView {
         }
     }
 
-    fn row_subtitle(&self, id: NodeId, wide: bool) -> String {
-        if let Some(owner) = self.results.hard_link_to(id) {
-            return format!("硬链接 · 已计入 {}", self.results.path(owner).display());
-        }
-        if self.page == Page::LargeFiles {
-            return self
-                .results
-                .parent(id)
-                .map(|parent| self.results.path(parent).display().to_string())
-                .unwrap_or_default();
-        }
+    fn row_annotation(&self, id: NodeId, cx: &App) -> Option<(String, Hsla)> {
+        let palette = Palette::for_theme(cx.theme());
         match self.results.kind(id) {
-            EntryKind::Directory => {
-                if self.results.size_overflow(id) {
-                    return "目录 · 已分配空间超出统计范围".into();
-                }
-                if self.results.errors(id) > 0 {
-                    return format!(
-                        "目录 · {} 项读取失败",
-                        format_count(self.results.errors(id))
-                    );
-                }
-                if !self.results.is_complete(id) {
-                    return if self.results.state == ScanState::Scanning {
-                        "目录 · 正在扫描".into()
-                    } else {
-                        "目录 · 尚未扫描完整".into()
-                    };
-                }
-                if self.results.child_count(id) == 0 {
-                    return "空目录".into();
-                }
-                if wide {
-                    "目录".into()
-                } else {
-                    format!(
-                        "目录 · {} 个直接子项",
-                        format_count(self.results.child_count(id))
-                    )
-                }
+            EntryKind::Directory if self.results.size_overflow(id) => {
+                Some(("大小超出范围".into(), palette.error))
             }
-            EntryKind::File => "文件".into(),
-            EntryKind::Symlink => "符号链接 · 未计入".into(),
-            EntryKind::Other => "特殊文件 · 未计入".into(),
+            EntryKind::Directory if self.results.errors(id) > 0 => Some((
+                format!("{} 项读取失败", format_count(self.results.errors(id))),
+                palette.error,
+            )),
+            EntryKind::Directory
+                if !self.results.is_complete(id) && self.results.state != ScanState::Scanning =>
+            {
+                Some(("未扫描完整".into(), palette.warning))
+            }
+            EntryKind::Directory if self.results.child_count(id) == 0 => {
+                Some(("空目录".into(), palette.text_tertiary))
+            }
+            EntryKind::Symlink | EntryKind::Other => Some(("未计入".into(), palette.text_tertiary)),
+            _ => None,
         }
     }
 
@@ -768,19 +740,26 @@ impl AppView {
         }
     }
 
-    fn entry_icon(&self, id: NodeId, cx: &App) -> Icon {
-        let size = px(15.0);
-        let color = match self.results.kind(id) {
-            EntryKind::Directory => cx.theme().chart_2,
-            _ => cx.theme().muted_foreground,
+    fn entry_icon(&self, id: NodeId, selected: bool, cx: &App) -> Icon {
+        let palette = Palette::for_theme(cx.theme());
+        let kind = self.results.kind(id);
+        let error = kind == EntryKind::Directory && self.results.errors(id) > 0;
+        let color = if error {
+            palette.error
+        } else if selected {
+            palette.data_accent
+        } else if kind == EntryKind::Directory {
+            palette.folder
+        } else {
+            palette.text_tertiary
         };
-        let name = match self.results.kind(id) {
+        let name = match kind {
             EntryKind::Directory => IconName::Folder,
             EntryKind::File => IconName::File,
             EntryKind::Symlink => IconName::Link2,
             EntryKind::Other => IconName::FileQuestionMark,
         };
-        Icon::new(name).with_size(size).text_color(color)
+        Icon::new(name).with_size(px(15.0)).text_color(color)
     }
 
     fn root_label(&self) -> String {
@@ -923,7 +902,7 @@ impl AppView {
         div()
             .id(entry.id)
             .w_full()
-            .h(px(28.0))
+            .h(px(layout::NAV_ROW))
             .px_2()
             .rounded(px(radius::CONTROL))
             .flex()
@@ -983,10 +962,12 @@ impl AppView {
             .partition(|entry| matches!(entry.action, NavAction::Page(_)));
 
         v_flex()
-            .w(px(216.0))
+            .w(px(layout::SIDEBAR))
             .h_full()
             .flex_shrink_0()
             .bg(theme.sidebar)
+            .border_r_1()
+            .border_color(palette.border)
             .text_color(theme.sidebar_foreground)
             .child(
                 h_flex()
@@ -1143,8 +1124,10 @@ impl AppView {
         };
 
         h_flex()
-            .h(px(52.0))
+            .h(px(layout::TOOLBAR))
             .bg(palette.toolbar)
+            .border_b_1()
+            .border_color(palette.border)
             .px_4()
             .gap_3()
             .child(
@@ -1210,6 +1193,15 @@ impl AppView {
         let scanning = self.results.state == ScanState::Scanning;
         let state_color = self.state_color(cx);
 
+        let mut stats = vec![
+            ("文件", format_count(self.results.files)),
+            ("目录", format_count(self.results.directories)),
+        ];
+        if !compact {
+            stats.push(("硬链接", format_count(self.results.hard_links)));
+            stats.push(("用时", self.elapsed_label().unwrap_or_else(|| "—".into())));
+        }
+
         let volume = if compact {
             None
         } else {
@@ -1222,26 +1214,31 @@ impl AppView {
                         (used as f64 / space.capacity as f64) as f32
                     };
                     v_flex()
-                        .w(px(228.0))
+                        .w(px(220.0))
                         .gap_1()
                         .child(
                             h_flex()
                                 .justify_between()
+                                .gap_3()
                                 .text_size(px(type_size::CAPTION))
-                                .text_color(palette.text_tertiary)
-                                .child("所选卷")
-                                .child(format!(
-                                    "可用 {} / {}",
-                                    format_bytes(space.available),
-                                    format_bytes(space.capacity)
-                                )),
+                                .child(div().text_color(palette.text_tertiary).child("所选卷"))
+                                .child(
+                                    div()
+                                        .text_color(palette.text_secondary)
+                                        .font_features(tabular_numbers())
+                                        .child(format!(
+                                            "可用 {} / {}",
+                                            format_bytes(space.available),
+                                            format_bytes(space.capacity)
+                                        )),
+                                ),
                         )
                         .child(
                             div()
                                 .w_full()
                                 .h(px(4.0))
                                 .rounded_full()
-                                .bg(theme.muted)
+                                .bg(palette.bar_track)
                                 .child(
                                     div()
                                         .h_full()
@@ -1253,13 +1250,13 @@ impl AppView {
                         .into_any_element()
                 }
                 Some(Err(error)) => div()
-                    .w(px(228.0))
+                    .w(px(220.0))
                     .text_size(px(type_size::CAPTION))
                     .text_color(palette.text_tertiary)
                     .child(format!("无法读取所选卷容量：{error}"))
                     .into_any_element(),
                 None => div()
-                    .w(px(228.0))
+                    .w(px(220.0))
                     .text_size(px(type_size::CAPTION))
                     .text_color(palette.text_tertiary)
                     .child("正在查询所选卷容量…")
@@ -1270,15 +1267,17 @@ impl AppView {
         v_flex()
             .bg(palette.recessed)
             .px_4()
-            .py_3()
+            .py_2()
             .gap_2()
+            .border_b_1()
+            .border_color(palette.border)
             .child(
                 h_flex()
-                    .gap_5()
                     .items_center()
+                    .gap_4()
                     .child(
                         v_flex()
-                            .min_w(px(150.0))
+                            .min_w(px(168.0))
                             .gap_1()
                             .child(
                                 div()
@@ -1289,10 +1288,10 @@ impl AppView {
                             .child(
                                 h_flex()
                                     .gap_2()
-                                    .items_baseline()
+                                    .items_center()
                                     .child(
                                         div()
-                                            .text_size(px(type_size::METRIC))
+                                            .text_size(px(type_size::DISPLAY))
                                             .font_semibold()
                                             .font_features(tabular_numbers())
                                             .child(total),
@@ -1317,33 +1316,26 @@ impl AppView {
                                             })
                                             .child(
                                                 div()
-                                                    .text_size(px(type_size::LABEL))
-                                                    .text_color(theme.muted_foreground)
+                                                    .text_size(px(type_size::CAPTION))
+                                                    .text_color(palette.text_tertiary)
                                                     .child(self.state_label()),
                                             ),
                                     ),
                             ),
                     )
-                    .child(metric("文件", format_count(self.results.files), &theme))
-                    .child(metric(
-                        "目录",
-                        format_count(self.results.directories),
-                        &theme,
-                    ))
-                    .when(!compact, |this| {
-                        this.child(metric(
-                            "硬链接别名",
-                            format_count(self.results.hard_links),
-                            &theme,
-                        ))
-                    })
-                    .when(!compact, |this| {
-                        this.child(metric(
-                            "用时",
-                            self.elapsed_label().unwrap_or_else(|| "—".into()),
-                            &theme,
-                        ))
-                    })
+                    .child(
+                        h_flex()
+                            .pl_5()
+                            .border_l_1()
+                            .border_color(palette.border)
+                            .gap_5()
+                            .items_center()
+                            .children(
+                                stats
+                                    .into_iter()
+                                    .map(|(label, value)| metric(label, value, &theme)),
+                            ),
+                    )
                     .child(div().flex_1())
                     .children(volume),
             )
@@ -1439,7 +1431,7 @@ impl AppView {
         let theme = cx.theme().clone();
         let palette = Palette::for_theme(&theme);
         h_flex()
-            .h(px(40.0))
+            .h(px(layout::CONTENT_TOOLBAR))
             .bg(palette.toolbar)
             .px_3()
             .gap_2()
@@ -1482,17 +1474,23 @@ impl AppView {
         let theme = cx.theme().clone();
         let palette = Palette::for_theme(&theme);
         h_flex()
-            .h(px(28.0))
+            .h(px(layout::TABLE_HEAD))
+            .border_b_1()
+            .border_color(palette.border)
             .bg(palette.recessed)
             .px_3()
             .gap_3()
             .text_size(px(type_size::CAPTION))
             .text_color(palette.text_tertiary)
-            .child(div().flex_1().min_w_0().pl(px(25.0)).child("名称"))
-            .when(wide && show_children, |this| {
-                this.child(div().w(px(88.0)).child("直接子项"))
+            .child(div().flex_1().min_w_0().pl(px(27.0)).child("名称"))
+            .when(self.page == Page::LargeFiles && wide, |this| {
+                this.child(div().w(px(200.0)).child("位置"))
             })
-            .child(div().w(px(158.0)).child("占比"))
+            .when(
+                self.page != Page::LargeFiles && wide && show_children,
+                |this| this.child(div().w(px(84.0)).text_right().child("直接子项")),
+            )
+            .child(div().w(px(150.0)).child("占比"))
             .child(div().w(px(92.0)).text_right().child("大小"))
             .into_any_element()
     }
@@ -1504,21 +1502,30 @@ impl AppView {
         let selected = self.selected() == Some(id);
         let kind = self.results.kind(id);
         let is_directory = kind == EntryKind::Directory;
+        let page = self.page;
         let name = self.results.name(id).to_string_lossy().into_owned();
-        let subtitle = self.row_subtitle(id, wide);
+        let annotation = self.row_annotation(id, cx);
         let share = self.share(id);
-        let bar_color = match kind {
-            EntryKind::Directory => theme.chart_2,
-            EntryKind::File => palette.meter,
-            _ => palette.text_disabled,
-        };
         let entity = cx.entity().downgrade();
         let path = self.results.to_path_buf(id);
-        let page = self.page;
+        let location = (page == Page::LargeFiles && wide)
+            .then(|| self.results.parent(id))
+            .flatten()
+            .map(|parent| self.results.path(parent).display().to_string());
+        let name_color = if selected {
+            palette.on_selected
+        } else {
+            palette.text_primary
+        };
+        let detail_color = if selected {
+            palette.on_selected.opacity(0.8)
+        } else {
+            palette.text_tertiary
+        };
 
         let row = div()
             .id(ElementId::named_usize(
-                if self.page == Page::Overview {
+                if page == Page::Overview {
                     "overview-row"
                 } else {
                     "row"
@@ -1527,13 +1534,13 @@ impl AppView {
             ))
             .relative()
             .w_full()
-            .h(px(ROW_HEIGHT))
+            .h(px(layout::ROW))
             .px_3()
             .gap_3()
             .flex()
             .items_center()
             .border_b_1()
-            .border_color(theme.border.opacity(0.55))
+            .border_color(palette.border)
             .bg(if selected {
                 theme.list_active
             } else {
@@ -1568,59 +1575,81 @@ impl AppView {
                     .top_0()
                     .bottom_0()
                     .w(px(2.0))
-                    .bg(theme.list_active_border)
+                    .bg(palette.selected_border)
             }))
-            .child(self.entry_icon(id, cx))
+            .child(self.entry_icon(id, selected, cx))
             .child(
-                v_flex()
+                h_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_0()
-                    .child(div().text_size(px(type_size::BODY)).truncate().child(name))
+                    .gap_2()
                     .child(
                         div()
-                            .text_size(px(type_size::CAPTION))
-                            .text_color(palette.text_tertiary)
+                            .min_w_0()
                             .truncate()
-                            .child(subtitle),
-                    ),
+                            .text_size(px(type_size::BODY))
+                            .text_color(name_color)
+                            .child(name),
+                    )
+                    .children(annotation.map(|(text, color)| {
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(type_size::CAPTION))
+                            .text_color(if selected { detail_color } else { color })
+                            .child(text)
+                    })),
             )
-            .when(wide && page != Page::LargeFiles, |this| {
+            .when(page != Page::LargeFiles && wide, |this| {
                 this.child(
                     div()
-                        .w(px(88.0))
+                        .w(px(84.0))
+                        .text_right()
                         .text_size(px(type_size::CAPTION))
-                        .text_color(palette.text_tertiary)
+                        .text_color(detail_color)
                         .font_features(tabular_numbers())
                         .child(self.child_count_label(id)),
                 )
             })
+            .children(location.map(|location| {
+                div()
+                    .w(px(200.0))
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(type_size::CAPTION))
+                    .text_color(detail_color)
+                    .child(location)
+            }))
             .child(
                 h_flex()
-                    .w(px(158.0))
-                    .gap_3()
+                    .w(px(150.0))
+                    .gap_2()
+                    .items_center()
                     .child(
                         div()
                             .flex_1()
                             .h(px(4.0))
                             .rounded_full()
-                            .bg(theme.muted)
+                            .bg(palette.bar_track)
                             .child(match share {
                                 Some(ratio) => div()
                                     .h_full()
                                     .w(relative(ratio.clamp(0.0, 1.0)))
                                     .rounded_full()
-                                    .bg(bar_color)
+                                    .bg(palette.bar_fill)
                                     .into_any_element(),
                                 None => div().h_full().w(px(0.0)).into_any_element(),
                             }),
                     )
                     .child(
                         div()
-                            .w(px(48.0))
+                            .w(px(46.0))
                             .text_right()
                             .text_size(px(type_size::CAPTION))
-                            .text_color(palette.text_tertiary)
+                            .text_color(if selected {
+                                detail_color
+                            } else {
+                                palette.text_secondary
+                            })
                             .font_features(tabular_numbers())
                             .child(self.share_label(id)),
                     ),
@@ -1630,7 +1659,13 @@ impl AppView {
                     .w(px(92.0))
                     .text_right()
                     .text_size(px(type_size::BODY))
+                    .font_medium()
                     .font_features(tabular_numbers())
+                    .text_color(if selected {
+                        palette.on_selected
+                    } else {
+                        palette.text_primary
+                    })
                     .child(self.entry_size(id)),
             );
 
@@ -1849,6 +1884,131 @@ impl AppView {
             .into_any_element()
     }
 
+    fn category_totals(&self) -> [u64; 10] {
+        let mut totals = [0u64; 10];
+        for id in self.results.child_ids(0) {
+            if self.results.hard_link_to(id).is_some() {
+                continue;
+            }
+            let bytes = self.results.bytes(id);
+            if bytes == 0 {
+                continue;
+            }
+            let name = self.results.name(id).to_string_lossy().into_owned();
+            let category = Category::classify(&name, self.results.kind(id));
+            totals[category.index()] = totals[category.index()].saturating_add(bytes);
+        }
+        totals
+    }
+
+    fn render_composition(&self, cx: &App) -> Option<AnyElement> {
+        if self.results.root_overflow() {
+            return None;
+        }
+        let palette = Palette::for_theme(cx.theme());
+        let totals = self.category_totals();
+        let total = totals
+            .iter()
+            .fold(0u64, |sum, bytes| sum.saturating_add(*bytes));
+        if total == 0 {
+            return None;
+        }
+        let mut rows: Vec<(Category, u64)> = Category::ALL
+            .into_iter()
+            .zip(totals)
+            .filter(|(_, bytes)| *bytes > 0)
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| left.0.index().cmp(&right.0.index()))
+        });
+
+        let mut bar = h_flex()
+            .h(px(6.0))
+            .w_full()
+            .rounded_full()
+            .overflow_hidden()
+            .bg(palette.bar_track);
+        for (category, bytes) in &rows {
+            bar = bar.child(
+                div()
+                    .h_full()
+                    .w(relative(*bytes as f32 / total as f32))
+                    .bg(palette.categories.color(*category)),
+            );
+        }
+
+        let mut legend_rows = rows.clone();
+        if legend_rows.len() > 6 {
+            let rest = legend_rows.split_off(5);
+            let rest_bytes = rest
+                .iter()
+                .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes));
+            match legend_rows
+                .iter_mut()
+                .find(|(category, _)| *category == Category::Other)
+            {
+                Some((_, bytes)) => *bytes = bytes.saturating_add(rest_bytes),
+                None => legend_rows.push((Category::Other, rest_bytes)),
+            }
+            legend_rows.sort_by(|left, right| {
+                right
+                    .1
+                    .cmp(&left.1)
+                    .then_with(|| left.0.index().cmp(&right.0.index()))
+            });
+        }
+
+        let mut legend = h_flex().gap_3().flex_wrap();
+        for (category, bytes) in &legend_rows {
+            let percent = *bytes as f64 / total as f64 * 100.0;
+            let percent = if percent < 0.5 {
+                "<1%".to_string()
+            } else {
+                format!("{percent:.0}%")
+            };
+            legend = legend.child(
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(palette.categories.color(*category)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(type_size::CAPTION))
+                            .text_color(palette.text_tertiary)
+                            .child(category.label()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(type_size::CAPTION))
+                            .text_color(palette.text_secondary)
+                            .font_features(tabular_numbers())
+                            .child(percent),
+                    ),
+            );
+        }
+
+        Some(
+            v_flex()
+                .px_3()
+                .py_2()
+                .gap_2()
+                .border_b_1()
+                .border_color(palette.border)
+                .child(bar)
+                .child(legend)
+                .into_any_element(),
+        )
+    }
+
     fn render_overview_body(
         &self,
         wide: bool,
@@ -1897,10 +2057,10 @@ impl AppView {
             v_flex()
                 .flex_shrink_0()
                 .border_t_1()
-                .border_color(theme.border)
+                .border_color(palette.border)
                 .child(
                     h_flex()
-                        .h(px(34.0))
+                        .h(px(32.0))
                         .px_3()
                         .gap_2()
                         .child(
@@ -1939,7 +2099,7 @@ impl AppView {
             .bg(theme.background)
             .child(
                 h_flex()
-                    .h(px(40.0))
+                    .h(px(layout::CONTENT_TOOLBAR))
                     .bg(palette.toolbar)
                     .px_3()
                     .gap_3()
@@ -1959,6 +2119,7 @@ impl AppView {
                             )),
                     ),
             )
+            .children(self.render_composition(cx))
             .child(self.render_table_header(wide, true, cx))
             .child(content)
             .children(largest)
@@ -1977,14 +2138,15 @@ impl AppView {
         let selected = self.overview_view.selected == Some(id);
         div()
             .id(ElementId::named_usize("overview-file", id))
+            .relative()
             .w_full()
-            .h(px(SMALL_ROW_HEIGHT))
+            .h(px(layout::ROW_COMPACT))
             .px_3()
             .gap_3()
             .flex()
             .items_center()
             .border_b_1()
-            .border_color(theme.border.opacity(0.45))
+            .border_color(palette.border)
             .bg(if selected {
                 theme.list_active
             } else {
@@ -2002,26 +2164,44 @@ impl AppView {
                 }
                 cx.notify();
             }))
+            .children(selected.then(|| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.0))
+                    .bg(palette.selected_border)
+            }))
             .child(
                 Icon::new(IconName::File)
                     .with_size(px(13.0))
-                    .text_color(theme.muted_foreground),
+                    .text_color(if selected {
+                        palette.data_accent
+                    } else {
+                        palette.text_tertiary
+                    }),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(type_size::LABEL))
                     .truncate()
+                    .text_size(px(type_size::LABEL))
+                    .text_color(if selected {
+                        palette.on_selected
+                    } else {
+                        palette.text_primary
+                    })
                     .child(name),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
+                    .truncate()
                     .text_size(px(type_size::CAPTION))
                     .text_color(palette.text_tertiary)
-                    .truncate()
                     .child(parent),
             )
             .child(
@@ -2029,7 +2209,7 @@ impl AppView {
                     .w(px(56.0))
                     .text_right()
                     .text_size(px(type_size::CAPTION))
-                    .text_color(palette.text_tertiary)
+                    .text_color(palette.text_secondary)
                     .font_features(tabular_numbers())
                     .child(self.share_label(id)),
             )
@@ -2038,7 +2218,13 @@ impl AppView {
                     .w(px(88.0))
                     .text_right()
                     .text_size(px(type_size::LABEL))
+                    .font_medium()
                     .font_features(tabular_numbers())
+                    .text_color(if selected {
+                        palette.on_selected
+                    } else {
+                        palette.text_primary
+                    })
                     .child(self.entry_size(id)),
             )
             .into_any_element()
@@ -2106,7 +2292,7 @@ impl AppView {
             .bg(theme.background)
             .child(
                 h_flex()
-                    .h(px(40.0))
+                    .h(px(layout::CONTENT_TOOLBAR))
                     .bg(palette.toolbar)
                     .px_3()
                     .gap_2()
@@ -2148,9 +2334,9 @@ impl AppView {
     fn render_issues_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let palette = Palette::for_theme(&theme);
-        let issue_border = theme.border.opacity(0.55);
+        let issue_border = palette.border;
         let issue_icon = theme.yellow;
-        let issue_muted = theme.muted_foreground;
+        let issue_muted = palette.text_tertiary;
         let content = if self.results.issues.is_empty() {
             let scanning = self.results.state == ScanState::Scanning;
             self.render_empty_state(
@@ -2182,7 +2368,7 @@ impl AppView {
                                     let issue = &this.results.issues[index];
                                     div()
                                         .w_full()
-                                        .min_h(px(54.0))
+                                        .min_h(px(48.0))
                                         .px_3()
                                         .py_2()
                                         .gap_3()
@@ -2232,7 +2418,7 @@ impl AppView {
             .bg(theme.background)
             .child(
                 h_flex()
-                    .h(px(40.0))
+                    .h(px(layout::CONTENT_TOOLBAR))
                     .bg(palette.toolbar)
                     .px_3()
                     .gap_2()
@@ -2266,11 +2452,12 @@ impl AppView {
                 .child(
                     Icon::new(IconName::MousePointer2)
                         .with_size(px(20.0))
-                        .text_color(theme.muted_foreground),
+                        .text_color(palette.text_tertiary),
                 )
                 .child(
                     div()
                         .text_size(px(type_size::BODY))
+                        .font_medium()
                         .child("选择一个条目查看详情"),
                 )
                 .child(
@@ -2283,7 +2470,6 @@ impl AppView {
                 )
                 .child(
                     div()
-                        .mt_2()
                         .max_w(px(220.0))
                         .text_center()
                         .text_size(px(type_size::CAPTION))
@@ -2294,9 +2480,18 @@ impl AppView {
             Some(id) => {
                 let name = self.results.name(id).to_string_lossy().into_owned();
                 let path = self.results.to_path_buf(id);
+                let kind = self.results.kind(id);
+                let is_directory = kind == EntryKind::Directory;
                 let size = self.entry_size(id);
                 let share = self.share_label(id);
-                let is_directory = self.results.kind(id) == EntryKind::Directory;
+                let category = Category::classify(&name, kind);
+                let category_color = palette.categories.color(category);
+                let icon = match kind {
+                    EntryKind::Directory => IconName::Folder,
+                    EntryKind::File => IconName::File,
+                    EntryKind::Symlink => IconName::Link2,
+                    EntryKind::Other => IconName::FileQuestionMark,
+                };
                 let mut details = Vec::new();
                 if self.page == Page::Directory
                     && self.directory != 0
@@ -2318,18 +2513,67 @@ impl AppView {
                     details.push(("已计入", self.results.path(owner).display().to_string()));
                 }
 
+                let primary = match (is_directory, self.page) {
+                    (true, _) => Some(
+                        button("enter-directory", false, &theme)
+                            .primary()
+                            .with_size(Size::Small)
+                            .w_full()
+                            .label("进入目录")
+                            .icon(IconName::CornerDownRight)
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.navigate(id, true, cx)),
+                            )
+                            .into_any_element(),
+                    ),
+                    (false, Page::LargeFiles) => Some(
+                        button("go-parent", false, &theme)
+                            .primary()
+                            .with_size(Size::Small)
+                            .w_full()
+                            .label("前往所在目录")
+                            .icon(IconName::CornerDownRight)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_parent();
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    ),
+                    (false, _) => Some(
+                        button("inspector-reveal-primary", self.revealing, &theme)
+                            .primary()
+                            .with_size(Size::Small)
+                            .w_full()
+                            .label(if self.revealing {
+                                "正在定位…"
+                            } else {
+                                "在 Finder 中显示"
+                            })
+                            .icon(IconName::FolderSearch)
+                            .on_click(cx.listener(|this, _, _, cx| this.reveal_selected(cx)))
+                            .into_any_element(),
+                    ),
+                };
+                let show_secondary_reveal = is_directory || self.page == Page::LargeFiles;
+
                 v_flex()
-                    .gap_3()
+                    .gap_4()
                     .child(
                         h_flex()
                             .gap_2()
                             .items_start()
-                            .child(self.entry_icon(id, cx))
+                            .child(Icon::new(icon).with_size(px(18.0)).text_color(
+                                if is_directory {
+                                    palette.folder
+                                } else {
+                                    palette.text_tertiary
+                                },
+                            ))
                             .child(
                                 v_flex()
                                     .flex_1()
                                     .min_w_0()
-                                    .gap_0()
+                                    .gap_1()
                                     .child(
                                         div()
                                             .text_size(px(type_size::HEADING))
@@ -2338,20 +2582,35 @@ impl AppView {
                                             .child(name),
                                     )
                                     .child(
-                                        div()
-                                            .text_size(px(type_size::CAPTION))
-                                            .text_color(palette.text_tertiary)
-                                            .child(self.kind_label(id)),
+                                        h_flex()
+                                            .gap_1()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .size(px(6.0))
+                                                    .rounded_full()
+                                                    .bg(category_color),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(type_size::CAPTION))
+                                                    .text_color(palette.text_tertiary)
+                                                    .child(format!(
+                                                        "{} · {}",
+                                                        self.kind_label(id),
+                                                        category.label()
+                                                    )),
+                                            ),
                                     ),
                             ),
                     )
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .items_baseline()
+                        v_flex()
+                            .gap_1()
+                            .pt_1()
                             .child(
                                 div()
-                                    .text_size(px(type_size::METRIC))
+                                    .text_size(px(type_size::DISPLAY))
                                     .font_semibold()
                                     .font_features(tabular_numbers())
                                     .child(size),
@@ -2363,11 +2622,13 @@ impl AppView {
                                     .child(format!("{} {}", self.share_caption(), share)),
                             ),
                     )
-                    .child(div().h(px(1.0)).w_full().bg(theme.border))
-                    .children(
-                        details
-                            .into_iter()
-                            .map(|(label, value)| detail_row(label, value, &theme)),
+                    .child(div().h(px(1.0)).w_full().bg(palette.border))
+                    .child(
+                        v_flex().gap_2().children(
+                            details
+                                .into_iter()
+                                .map(|(label, value)| detail_row(label, value, &theme)),
+                        ),
                     )
                     .child(
                         v_flex()
@@ -2382,89 +2643,116 @@ impl AppView {
                                 div()
                                     .text_size(px(type_size::CAPTION))
                                     .font_family(theme.mono_font_family.clone())
+                                    .text_color(palette.text_secondary)
                                     .whitespace_normal()
-                                    .line_clamp(4)
+                                    .line_clamp(3)
                                     .child(path.display().to_string()),
                             ),
                     )
                     .child(
                         div()
-                            .p_2()
-                            .rounded(px(radius::CONTROL))
-                            .bg(theme.muted)
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(palette.border)
                             .text_size(px(type_size::CAPTION))
                             .text_color(palette.text_tertiary)
+                            .line_height(px(17.0))
                             .whitespace_normal()
                             .child(self.explanation(id)),
                     )
+                    .child(div().h(px(1.0)).w_full().bg(palette.border))
                     .child(
                         v_flex()
                             .gap_1()
-                            .children(is_directory.then(|| {
-                                button("enter-directory", false, &theme)
-                                    .with_size(Size::Small)
-                                    .w_full()
-                                    .label("进入目录")
-                                    .icon(IconName::CornerDownRight)
-                                    .secondary()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.navigate(id, true, cx)
-                                    }))
-                            }))
-                            .children((self.page == Page::LargeFiles).then(|| {
-                                button("go-parent", false, &theme)
-                                    .with_size(Size::Small)
-                                    .w_full()
-                                    .label("前往所在目录")
-                                    .icon(IconName::CornerDownRight)
-                                    .secondary()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_parent();
-                                        cx.notify();
-                                    }))
-                            }))
-                            .child(
-                                button("inspector-reveal", self.revealing, &theme)
-                                    .with_size(Size::Small)
-                                    .w_full()
-                                    .label(if self.revealing {
-                                        "正在定位…"
+                            .children(primary)
+                            .children(show_secondary_reveal.then(|| {
+                                self.render_action_row(
+                                    "inspector-reveal",
+                                    if self.revealing {
+                                        "正在定位…".into()
                                     } else {
-                                        "在 Finder 中显示"
-                                    })
-                                    .icon(IconName::FolderSearch)
-                                    .secondary()
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.reveal_selected(cx)),
-                                    ),
-                            )
-                            .child(
-                                button("inspector-copy", false, &theme)
-                                    .with_size(Size::Small)
-                                    .w_full()
-                                    .label("复制路径")
-                                    .icon(IconName::Copy)
-                                    .ghost()
-                                    .on_click(cx.listener(|this, _, _, cx| this.copy_selected(cx))),
-                            ),
+                                        "在 Finder 中显示".into()
+                                    },
+                                    IconName::FolderSearch,
+                                    palette.text_secondary,
+                                    !self.revealing,
+                                    |this, _, _, cx| this.reveal_selected(cx),
+                                    cx,
+                                )
+                            }))
+                            .child(self.render_action_row(
+                                "inspector-copy",
+                                "复制路径".into(),
+                                IconName::Copy,
+                                palette.text_tertiary,
+                                true,
+                                |this, _, _, cx| this.copy_selected(cx),
+                                cx,
+                            )),
                     )
                     .into_any_element()
             }
         };
 
         v_flex()
-            .w(px(INSPECTOR_WIDTH))
+            .w(px(layout::INSPECTOR))
             .h_full()
             .flex_shrink_0()
             .bg(palette.toolbar)
+            .border_l_1()
+            .border_color(palette.border)
             .child(
                 v_flex()
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scrollbar()
-                    .p_3()
+                    .px_4()
+                    .py_4()
                     .child(body),
             )
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_action_row<F>(
+        &self,
+        id: &'static str,
+        label: String,
+        icon: IconName,
+        color: Hsla,
+        enabled: bool,
+        handler: F,
+        cx: &mut Context<Self>,
+    ) -> AnyElement
+    where
+        F: Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static,
+    {
+        let palette = Palette::for_theme(cx.theme());
+        h_flex()
+            .id(id)
+            .w_full()
+            .h(px(layout::ROW_COMPACT))
+            .px_2()
+            .rounded(px(radius::CONTROL))
+            .gap_2()
+            .items_center()
+            .text_size(px(type_size::LABEL))
+            .text_color(if enabled {
+                color
+            } else {
+                palette.text_disabled
+            })
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(palette.hover))
+                    .on_click(cx.listener(handler))
+            })
+            .child(Icon::new(icon).with_size(px(14.0)).text_color(if enabled {
+                color
+            } else {
+                palette.text_disabled
+            }))
+            .child(label)
             .into_any_element()
     }
 
@@ -2631,6 +2919,9 @@ impl AppView {
         let theme = cx.theme().clone();
         let palette = Palette::for_theme(&theme);
         let selected = self.selected();
+        let directory_selected = selected
+            .filter(|id| self.results.kind(*id) == EntryKind::Directory)
+            .is_some();
         let left = if let Some(id) = selected {
             let path = self.results.to_path_buf(id);
             h_flex()
@@ -2647,6 +2938,7 @@ impl AppView {
                 )
                 .child(
                     div()
+                        .flex_shrink_0()
                         .text_size(px(type_size::CAPTION))
                         .text_color(palette.text_tertiary)
                         .font_features(tabular_numbers())
@@ -2657,23 +2949,38 @@ impl AppView {
             div()
                 .text_size(px(type_size::CAPTION))
                 .text_color(palette.text_tertiary)
-                .child("已分配空间不等于可释放空间 · 选择条目查看完整路径")
+                .child("已分配空间不等于可释放空间")
                 .into_any_element()
         };
 
+        let hints = match self.page {
+            Page::Directory if directory_selected => "Enter 进入 · ⌫ 返回 · ⌘C 复制",
+            Page::Directory if selected.is_none() => "↑↓ 选择 · Enter 进入",
+            Page::Directory => "⌫ 返回 · ⌘C 复制 · ⌘I 详情",
+            Page::Overview if directory_selected => "Enter 进入 · ⌘C 复制 · ⌘I 详情",
+            Page::Overview if selected.is_none() => "↑↓ 选择 · Enter 进入",
+            Page::Overview => "⌘C 复制 · ⌘I 详情",
+            Page::LargeFiles if selected.is_none() => "↑↓ 选择 · Enter 所在目录",
+            Page::LargeFiles => "Enter 所在目录 · ⌘C 复制路径",
+            Page::Issues => "",
+        };
+
         h_flex()
-            .h(px(26.0))
+            .h(px(layout::STATUS))
             .px_3()
             .gap_3()
             .bg(theme.status_bar)
+            .border_t_1()
+            .border_color(palette.border)
             .child(left)
             .child(div().flex_1())
-            .when(!compact, |this| {
+            .when(!compact && !hints.is_empty(), |this| {
                 this.child(
                     div()
+                        .flex_shrink_0()
                         .text_size(px(type_size::CAPTION))
-                        .text_color(palette.text_tertiary)
-                        .child("↑↓ 选择 · Enter 进入 · ⌫ 返回 · ⌘C 复制 · ⌘I 详情"),
+                        .text_color(palette.text_disabled)
+                        .child(hints),
                 )
             })
             .into_any_element()
@@ -2687,7 +2994,12 @@ impl Render for AppView {
         let width = window.viewport_size().width.as_f32();
         let height = window.viewport_size().height.as_f32();
         let compact = width < 980.0;
-        let wide_rows = width >= 1000.0;
+        let wide_rows = width
+            >= if self.page == Page::LargeFiles {
+                1160.0
+            } else {
+                1000.0
+            };
         let show_inspector = self.show_inspector && width >= 1080.0 && self.page != Page::Issues;
         let has_scan = self.scan_root.is_some();
         let idle = self.results.state == ScanState::Idle && !has_scan && self.results.is_empty();
@@ -2756,7 +3068,8 @@ fn section_label(text: &str, color: Hsla) -> AnyElement {
 fn metric(label: &str, value: String, theme: &Theme) -> AnyElement {
     let palette = Palette::for_theme(theme);
     v_flex()
-        .gap_1()
+        .min_w(px(52.0))
+        .gap(px(2.0))
         .child(
             div()
                 .text_size(px(type_size::CAPTION))
@@ -2782,13 +3095,14 @@ fn detail_row(label: &str, value: String, theme: &Theme) -> AnyElement {
         .child(
             div()
                 .flex_shrink_0()
-                .text_color(theme.muted_foreground)
+                .text_color(Palette::for_theme(theme).text_tertiary)
                 .child(label.to_string()),
         )
         .child(
             div()
                 .min_w_0()
                 .text_right()
+                .text_color(theme.muted_foreground)
                 .whitespace_normal()
                 .child(value),
         )

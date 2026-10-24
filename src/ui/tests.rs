@@ -335,7 +335,7 @@ fn hard_link_aliases_never_claim_a_share_and_keep_their_owner_explanation() {
     }]);
     view.navigate_to(1, false);
     assert_eq!(view.share_label(5), "已去重");
-    assert!(view.row_subtitle(5, true).contains("/root/top"));
+    assert!(view.explanation(5).contains("/root/top"));
     assert!(view.explanation(5).contains("不重复统计"));
 }
 
