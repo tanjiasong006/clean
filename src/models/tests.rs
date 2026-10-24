@@ -452,8 +452,7 @@ fn nodes_store_names_in_chunks_and_reconstruct_exact_paths() {
     assert!(results.is_complete(2));
     // Root, nested directory, and the file: the file has no directory data.
     assert_eq!(results.child_count(0), 1);
-    #[cfg(target_pointer_width = "64")]
-    assert_eq!(std::mem::size_of::<Node>(), 8);
+    assert_eq!(std::mem::size_of::<Node>(), 6);
 }
 
 #[test]
@@ -624,7 +623,37 @@ fn long_names_intern_exactly_across_the_length_byte_boundary() {
 }
 
 #[test]
+fn files_above_the_inline_block_limit_keep_their_exact_size() {
+    let sizes = [
+        2 * 1024_u64 * 1024 * 1024 - 1024, // largest block count stored inline
+        2 * 1024_u64 * 1024 * 1024,
+        3 * 1024_u64 * 1024 * 1024 + 512,
+    ];
+    let mut results = ScanResults::default();
+    let mut events = vec![ScanEvent::Entry {
+        path: "/root".into(),
+        parent: None,
+        kind: EntryKind::Directory,
+        bytes: 512,
+        hard_link_to: None,
+    }];
+    for (index, bytes) in sizes.iter().enumerate() {
+        events.push(ScanEvent::Entry {
+            path: format!("/root/file-{index}").into(),
+            parent: Some(0),
+            kind: EntryKind::File,
+            bytes: *bytes,
+            hard_link_to: None,
+        });
+    }
+    results.apply_batch(events);
+    for (index, bytes) in sizes.iter().enumerate() {
+        assert_eq!(results.bytes(index + 1), *bytes);
+    }
+}
+
+#[test]
 fn directory_records_stay_small() {
     assert!(std::mem::size_of::<DirectoryData>() <= 32);
-    assert!(std::mem::size_of::<Node>() <= 8);
+    assert_eq!(std::mem::size_of::<Node>(), 6);
 }

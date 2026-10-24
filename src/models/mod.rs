@@ -49,18 +49,23 @@ pub enum EntryKind {
     Other,
 }
 
-const KIND_FILE: u32 = 0 << 30;
-const KIND_DIRECTORY: u32 = 1 << 30;
-const KIND_SYMLINK: u32 = 2 << 30;
-const KIND_OTHER: u32 = 3 << 30;
-const KIND_MASK: u32 = 3 << 30;
-/// A payload too large for the inline field stores its value in a side map.
-const ESCAPED: u32 = 1 << 29;
-const PAYLOAD_MASK: u32 = (1 << 29) - 1;
+const PAYLOAD_BITS: u32 = 22;
+const KIND_FILE: u32 = 0 << PAYLOAD_BITS;
+const KIND_DIRECTORY: u32 = 1 << PAYLOAD_BITS;
+const KIND_SYMLINK: u32 = 2 << PAYLOAD_BITS;
+const KIND_OTHER: u32 = 3 << PAYLOAD_BITS;
+const KIND_MASK: u32 = 3 << PAYLOAD_BITS;
+const PAYLOAD_MASK: u32 = (1 << PAYLOAD_BITS) - 1;
+/// A file whose block count does not fit the inline field stores its exact byte
+/// total in a side map.
+const ESCAPED_BLOCKS: u32 = PAYLOAD_MASK;
 
 const BLOCK_SIZE: u64 = 512;
-const MAX_INLINE_BLOCKS: u64 = PAYLOAD_MASK as u64;
-const MAX_DIRECTORIES: usize = PAYLOAD_MASK as usize;
+/// Files at or above roughly 2 GiB keep their exact byte total in the side map.
+const MAX_INLINE_BLOCKS: u64 = (PAYLOAD_MASK - 1) as u64;
+const MAX_DIRECTORIES: usize = 1 << PAYLOAD_BITS;
+/// Nodes hold 24-bit dictionary ids.
+const MAX_NAMES: usize = 1 << 24;
 
 const NAME_CHUNK: usize = 1 << 20;
 const NODE_CHUNK: usize = 1 << 16;
@@ -71,16 +76,39 @@ const NAME_BLOCK: usize = 32;
 /// A dictionary length byte; entries that long keep their length in a side map.
 const LONG_NAME: u8 = u8::MAX;
 
-#[derive(Clone, Copy, Debug)]
+/// A node occupies six bytes: a 24-bit dictionary id for the entry's name and
+/// a 24-bit kind/payload word. Fields are byte arrays so the in-memory layout
+/// stays six bytes without an alignment gap.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct Node {
-    /// Dictionary id of the entry's name.
-    name: u32,
-    info: u32,
+    name: [u8; 3],
+    info: [u8; 3],
 }
 
 impl Node {
+    fn new(name: u32, info: u32) -> Self {
+        debug_assert!((name as usize) < MAX_NAMES);
+        debug_assert!(info < 1 << 24);
+        let name = name.to_le_bytes();
+        let info = info.to_le_bytes();
+        Self {
+            name: [name[0], name[1], name[2]],
+            info: [info[0], info[1], info[2]],
+        }
+    }
+
+    /// Dictionary id of the entry's name.
+    fn name_id(self) -> u32 {
+        u24(self.name)
+    }
+
+    fn info_bits(self) -> u32 {
+        u24(self.info)
+    }
+
     fn kind(self) -> EntryKind {
-        match self.info & KIND_MASK {
+        match self.info_bits() & KIND_MASK {
             KIND_DIRECTORY => EntryKind::Directory,
             KIND_SYMLINK => EntryKind::Symlink,
             KIND_OTHER => EntryKind::Other,
@@ -89,11 +117,24 @@ impl Node {
     }
 
     fn ordinal(self) -> usize {
-        (self.info & PAYLOAD_MASK) as usize
+        (self.info_bits() & PAYLOAD_MASK) as usize
     }
 
     fn escaped(self) -> bool {
-        self.info & ESCAPED != 0
+        self.kind() == EntryKind::File && self.info_bits() & PAYLOAD_MASK == ESCAPED_BLOCKS
+    }
+}
+
+fn u24(bytes: [u8; 3]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0])
+}
+
+impl fmt::Debug for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Node")
+            .field("name", &self.name_id())
+            .field("info", &self.info_bits())
+            .finish()
     }
 }
 
@@ -268,8 +309,8 @@ impl NameDict {
     fn push(&mut self, name: &[u8]) -> u32 {
         let id = self.lengths.len();
         assert!(
-            id < u32::MAX as usize,
-            "scan contains too many unique names"
+            id < MAX_NAMES,
+            "scan contains too many unique names for 24-bit node ids"
         );
         if id.is_multiple_of(NAME_BLOCK) {
             self.block_offsets.push(self.bytes.len() as u32);
@@ -464,11 +505,11 @@ impl ScanResults {
         self.nodes.is_empty()
     }
 
-    fn push_node(&mut self, node: Node) {
+    fn push_node(&mut self, name: u32, info: u32) {
         if self.nodes.len() == self.nodes.capacity() {
             self.nodes.reserve_exact(NODE_CHUNK);
         }
-        self.nodes.push(node);
+        self.nodes.push(Node::new(name, info));
     }
 
     pub fn kind(&self, id: NodeId) -> EntryKind {
@@ -480,7 +521,7 @@ impl ScanResults {
         match node.kind() {
             EntryKind::Directory => self.directory_data[node.ordinal()].bytes,
             _ if node.escaped() => self.escaped.get(&id).copied().unwrap_or(0),
-            _ => (node.info & PAYLOAD_MASK) as u64 * BLOCK_SIZE,
+            _ => (node.info_bits() & PAYLOAD_MASK) as u64 * BLOCK_SIZE,
         }
     }
 
@@ -559,7 +600,7 @@ impl ScanResults {
     }
 
     pub fn name_bytes(&self, id: NodeId) -> Cow<'_, [u8]> {
-        self.names.read(self.nodes[id].name)
+        self.names.read(self.nodes[id].name_id())
     }
 
     pub fn name(&self, id: NodeId) -> NodeName<'_> {
@@ -580,7 +621,7 @@ impl ScanResults {
 
     #[cfg(test)]
     pub fn name_id(&self, id: NodeId) -> u32 {
-        self.nodes[id].name
+        self.nodes[id].name_id()
     }
 
     pub fn path(&self, id: NodeId) -> NodePath {
@@ -688,13 +729,13 @@ impl ScanResults {
                                 KIND_FILE | blocks as u32
                             } else {
                                 self.escaped.insert(id, bytes);
-                                KIND_FILE | ESCAPED
+                                KIND_FILE | ESCAPED_BLOCKS
                             }
                         }
                         EntryKind::Symlink => KIND_SYMLINK,
                         EntryKind::Other => KIND_OTHER,
                     };
-                    self.push_node(Node { name, info });
+                    self.push_node(name, info);
                     if let Some(parent) = parent {
                         self.attach(parent, id);
                         deltas.entry(parent).or_default().merge(&Delta {
