@@ -664,3 +664,28 @@ fn large_directory_worker_pipeline() {
         FILES as f64 / elapsed.as_secs_f64()
     );
 }
+
+#[test]
+fn a_sparse_image_can_exceed_volume_capacity_without_being_counted_twice() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = TempDirectory::new();
+    let image = temp.0.join("virtual-disk.raw");
+    let logical_bytes = 1024_u64.pow(4);
+    // set_len creates holes; this test does not write or allocate a TiB of data.
+    fs::File::create(&image)
+        .unwrap()
+        .set_len(logical_bytes)
+        .unwrap();
+    let metadata = fs::symlink_metadata(&image).unwrap();
+    let allocated_bytes = metadata.blocks().checked_mul(512).unwrap();
+    let results = collect_real(&temp.0);
+    assert_eq!(results.state, ScanState::Complete);
+    assert_eq!(results.files, 1);
+    assert_eq!(results.nodes.len(), 2);
+    assert_eq!(results.nodes[0].bytes, logical_bytes);
+    assert_eq!(node(&results, &image).bytes, metadata.len());
+    assert!(results.nodes[0].bytes > 512_000_000_000);
+    assert!(allocated_bytes < logical_bytes);
+    assert_eq!(metadata.nlink(), 1);
+    assert!(results.issues.is_empty());
+}

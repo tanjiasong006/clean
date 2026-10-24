@@ -174,3 +174,41 @@ fn finishing_flushes_throttled_visible_results_immediately() {
     assert!(view.refresh_if_due());
     assert_eq!(view.visible[0], 5);
 }
+
+#[test]
+fn capacity_notice_compares_logical_total_to_capacity_not_available_space() {
+    let mut view = populated_view();
+    let bytes = view.results.nodes[0].bytes;
+    view.disk_space = Some(Ok(crate::models::DiskSpace {
+        capacity: bytes + 1,
+        available: 0,
+    }));
+    assert!(view.capacity_notice().is_none());
+    view.disk_space = Some(Ok(crate::models::DiskSpace {
+        capacity: bytes,
+        available: 0,
+    }));
+    assert!(view.capacity_notice().is_none());
+    view.disk_space = Some(Ok(crate::models::DiskSpace {
+        capacity: bytes - 1,
+        available: 0,
+    }));
+    assert!(view.capacity_notice().is_some());
+    assert_eq!(view.results.nodes[0].bytes, bytes);
+}
+
+#[test]
+fn capacity_notice_needs_a_known_capacity_and_an_exact_logical_total() {
+    let mut view = populated_view();
+    assert!(view.capacity_notice().is_none());
+    view.disk_space = Some(Err("volume query failed".into()));
+    assert!(view.capacity_notice().is_none());
+    view.disk_space = Some(Ok(crate::models::DiskSpace {
+        capacity: 1,
+        available: 0,
+    }));
+    view.results.nodes[0].size_overflow = true;
+    assert!(view.capacity_notice().is_none());
+    view.results.nodes.clear();
+    assert!(view.capacity_notice().is_none());
+}

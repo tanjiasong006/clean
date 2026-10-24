@@ -167,6 +167,14 @@ impl AppView {
         }
     }
 
+    fn capacity_notice(&self) -> Option<&'static str> {
+        let root = self.results.nodes.first()?;
+        let space = self.disk_space.as_ref()?.as_ref().ok()?;
+        (!root.size_overflow && root.bytes > space.capacity).then_some(
+            "逻辑总量已超过所选卷容量，但不代表实际磁盘占用。稀疏文件、硬链接或跨卷扫描等均可能造成差异。",
+        )
+    }
+
     fn poll(&mut self, cx: &mut Context<Self>) -> bool {
         let started = Instant::now();
         let mut changed = false;
@@ -692,12 +700,13 @@ impl Render for AppView {
                 .child(div().text_lg().child(self.results.state.label())).child(cancel))
             .child(div().text_sm().truncate().text_color(cx.theme().muted_foreground)
                 .child(root_path.unwrap_or_else(|| "尚未选择扫描位置".into())))
-            .child(div().text_2xl().child(format!("{} · {} 个文件 · {} 个目录",
+            .child(div().text_2xl().child(format!("逻辑总量 {} · {} 个文件 · {} 个目录",
                 logical_size, self.results.files, self.results.directories)))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!(
-                "逻辑大小 · 硬链接按路径重复计数 · 跳过 {} 个符号链接 · 此统计不代表可释放空间",
+                "文件逻辑大小累加，非磁盘实际占用 · 硬链接按路径重复计数 · 跳过 {} 个符号链接 · 非可释放空间",
                 self.results.symlinks)))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(disk_label))
+            .children(self.capacity_notice().map(|notice| div().text_sm().child(notice)))
             .children(self.notice.clone().map(|notice| div().text_sm().child(notice)));
 
         let crumbs = ancestors.into_iter().map(|id| {
