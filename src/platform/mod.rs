@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 
 #[cfg(target_os = "macos")]
+mod alloc;
+#[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+pub use alloc::LargeAllocator;
 #[cfg(target_os = "macos")]
 pub use macos::{disk_space, reveal_in_finder};
 

@@ -6,6 +6,10 @@ mod ui;
 
 use gpui_kit::*;
 
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static ALLOCATOR: platform::LargeAllocator = platform::LargeAllocator;
+
 fn main() {
     application().with_assets(assets::Assets).run(|cx| {
         init(cx);
