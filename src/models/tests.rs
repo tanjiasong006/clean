@@ -418,6 +418,35 @@ fn directory_allocation_and_hard_link_ownership_survive_batch_boundaries() {
 }
 
 #[test]
+fn hard_link_aliases_are_indexed_in_node_order_across_batches() {
+    let mut results = ScanResults::default();
+    let entry = |path: &str, id: usize, target: Option<usize>| ScanEvent::Entry {
+        path: path.into(),
+        parent: (id > 0).then_some(0),
+        kind: if id == 0 {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        },
+        bytes: if target.is_some() { 0 } else { 512 },
+        hard_link_to: target,
+    };
+    results.apply_batch([entry("/root", 0, None), entry("/root/original", 1, None)]);
+    results.apply_batch([entry("/root/alias-1", 2, Some(1))]);
+    results.apply_batch([
+        entry("/root/alias-2", 3, Some(1)),
+        entry("/root/alias-3", 4, Some(1)),
+    ]);
+    assert_eq!(results.hard_links, 3);
+    assert_eq!(results.hard_link_to(1), None);
+    for alias in 2..=4 {
+        assert_eq!(results.hard_link_to(alias), Some(1), "alias {alias}");
+    }
+    results.apply_batch([ScanEvent::Finished(ScanState::Complete)]);
+    assert_eq!(results.hard_link_to(3), Some(1));
+}
+
+#[test]
 fn nodes_store_names_in_chunks_and_reconstruct_exact_paths() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 

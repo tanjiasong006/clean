@@ -458,7 +458,8 @@ pub struct ScanResults {
     escaped: HashMap<NodeId, u64>,
     /// Per-directory read-error count and overflow flag, keyed by ordinal.
     directory_faults: HashMap<u32, u32>,
-    hard_link_targets: HashMap<NodeId, NodeId>,
+    /// Hard-link aliases as (node id, first-seen node id), in node order.
+    hard_link_targets: Vec<(u32, u32)>,
     pub issues: Vec<ScanIssue>,
     pub files: usize,
     pub directories: usize,
@@ -582,7 +583,11 @@ impl ScanResults {
     }
 
     pub fn hard_link_to(&self, id: NodeId) -> Option<NodeId> {
-        self.hard_link_targets.get(&id).copied()
+        let key = u32::try_from(id).ok()?;
+        self.hard_link_targets
+            .binary_search_by_key(&key, |&(alias, _)| alias)
+            .ok()
+            .map(|index| self.hard_link_targets[index].1 as usize)
     }
 
     pub fn child_ids(&self, id: NodeId) -> Range<NodeId> {
@@ -764,7 +769,17 @@ impl ScanResults {
                         });
                     }
                     if let Some(target) = hard_link_to {
-                        self.hard_link_targets.insert(id, target);
+                        let alias = u32::try_from(id)
+                            .expect("node count exceeds the compact hard link index");
+                        let target = u32::try_from(target)
+                            .expect("node count exceeds the compact hard link index");
+                        debug_assert!(
+                            self.hard_link_targets
+                                .last()
+                                .is_none_or(|&(last, _)| last < alias),
+                            "hard link aliases must be recorded in node order"
+                        );
+                        self.hard_link_targets.push((alias, target));
                     }
                 }
                 ScanEvent::DirectoryRead(id) => {
