@@ -634,7 +634,17 @@ impl ScanResults {
                         deltas.entry(parent).or_default().errors += 1;
                     }
                 }
-                ScanEvent::Finished(state) => self.state = state,
+                ScanEvent::Finished(state) => {
+                    self.state = state;
+                    // Traversal is over, so capacity reserved while growing is
+                    // dead weight: the directory table halves to its actual
+                    // occupancy and the alias tables drop unused buckets.
+                    self.directory_data.shrink_to_fit();
+                    self.by_first_child.shrink_to_fit();
+                    self.escaped.shrink_to_fit();
+                    self.hard_link_targets.shrink_to_fit();
+                    self.issues.shrink_to_fit();
+                }
             }
         }
         let mut changes = Vec::new();
