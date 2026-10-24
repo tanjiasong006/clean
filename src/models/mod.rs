@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    ffi::OsStr,
+    fmt,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 pub type NodeId = usize;
 
@@ -33,22 +41,149 @@ pub enum EntryKind {
 }
 
 #[derive(Debug)]
+pub struct NodePath {
+    parent: Option<Arc<NodePath>>,
+    name: Box<OsStr>,
+}
+
+impl NodePath {
+    pub fn file_name(&self) -> Option<&OsStr> {
+        Path::new(&self.name).file_name()
+    }
+
+    pub fn name(&self) -> &OsStr {
+        &self.name
+    }
+
+    pub fn to_path_buf(&self) -> PathBuf {
+        let mut components = Vec::new();
+        let mut current = self;
+        while let Some(parent) = &current.parent {
+            components.push(current.name());
+            current = parent;
+        }
+        let mut path = PathBuf::from(current.name());
+        for name in components.into_iter().rev() {
+            path.push(name);
+        }
+        path
+    }
+
+    pub fn display(&self) -> &Self {
+        self
+    }
+
+    fn depth(&self) -> usize {
+        let mut depth = 0;
+        let mut current = self;
+        while let Some(parent) = &current.parent {
+            depth += 1;
+            current = parent;
+        }
+        depth
+    }
+}
+
+impl fmt::Display for NodePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_path_buf().display().fmt(f)
+    }
+}
+
+impl Ord for NodePath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if std::ptr::eq(self, other) {
+            return Ordering::Equal;
+        }
+        if let (Some(a), Some(b)) = (&self.parent, &other.parent)
+            && Arc::ptr_eq(a, b)
+        {
+            return self.name.cmp(&other.name);
+        }
+        let self_depth = self.depth();
+        let other_depth = other.depth();
+        let mut a = self;
+        let mut b = other;
+        for _ in other_depth..self_depth {
+            a = a.parent.as_deref().unwrap();
+        }
+        for _ in self_depth..other_depth {
+            b = b.parent.as_deref().unwrap();
+        }
+        if std::ptr::eq(a, b) {
+            return self_depth.cmp(&other_depth);
+        }
+        // Shared ancestry lets ties compare components without allocating absolute paths.
+        while let (Some(a_parent), Some(b_parent)) = (&a.parent, &b.parent) {
+            if Arc::ptr_eq(a_parent, b_parent) {
+                let order = a.name.cmp(&b.name);
+                if order != Ordering::Equal {
+                    return order;
+                }
+                break;
+            }
+            a = a_parent;
+            b = b_parent;
+        }
+        self.to_path_buf().cmp(&other.to_path_buf())
+    }
+}
+
+impl PartialOrd for NodePath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for NodePath {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for NodePath {}
+
+#[derive(Debug)]
 pub struct Node {
-    pub path: Arc<PathBuf>,
-    pub parent: Option<NodeId>,
+    pub path: Arc<NodePath>,
     pub kind: EntryKind,
     pub bytes: u64,
     pub size_overflow: bool,
-    // A repeated inode contributes zero bytes and refers to its first observed path.
-    pub hard_link_to: Option<NodeId>,
-    pub children: Vec<NodeId>,
-    pub pending_directories: usize,
-    pub errors: usize,
+    parent: Option<NonZeroUsize>,
+    hard_link_to: Option<NonZeroUsize>,
+    directory: Option<Box<DirectoryData>>,
+}
+
+#[derive(Debug)]
+struct DirectoryData {
+    children: Vec<NodeId>,
+    pending: usize,
+    errors: usize,
 }
 
 impl Node {
+    pub fn parent(&self) -> Option<NodeId> {
+        self.parent.map(|id| id.get() - 1)
+    }
+
+    pub fn hard_link_to(&self) -> Option<NodeId> {
+        self.hard_link_to.map(|id| id.get() - 1)
+    }
+
+    pub fn children(&self) -> &[NodeId] {
+        self.directory.as_ref().map_or(&[], |data| &data.children)
+    }
+
+    pub fn pending_directories(&self) -> usize {
+        self.directory.as_ref().map_or(0, |data| data.pending)
+    }
+
+    pub fn errors(&self) -> usize {
+        self.directory.as_ref().map_or(0, |data| data.errors)
+    }
+
     pub fn is_complete(&self) -> bool {
-        self.pending_directories == 0 && self.errors == 0 && !self.size_overflow
+        self.pending_directories() == 0 && self.errors() == 0 && !self.size_overflow
     }
 }
 
@@ -139,19 +274,36 @@ impl ScanResults {
                         EntryKind::Symlink => self.symlinks += 1,
                         EntryKind::Other => {}
                     }
+                    let path = Arc::new(NodePath {
+                        parent: parent.map(|id| self.nodes[id].path.clone()),
+                        name: if parent.is_some() {
+                            path.file_name().unwrap().into()
+                        } else {
+                            path.into_os_string().into_boxed_os_str()
+                        },
+                    });
                     self.nodes.push(Node {
-                        path: Arc::new(path),
-                        parent,
+                        path,
+                        parent: parent.map(|id| NonZeroUsize::new(id + 1).unwrap()),
                         kind,
                         bytes,
                         size_overflow: false,
-                        hard_link_to,
-                        children: Vec::new(),
-                        pending_directories: pending,
-                        errors: 0,
+                        hard_link_to: hard_link_to.map(|id| NonZeroUsize::new(id + 1).unwrap()),
+                        directory: (kind == EntryKind::Directory).then(|| {
+                            Box::new(DirectoryData {
+                                children: Vec::new(),
+                                pending,
+                                errors: 0,
+                            })
+                        }),
                     });
                     if let Some(parent) = parent {
-                        self.nodes[parent].children.push(id);
+                        self.nodes[parent]
+                            .directory
+                            .as_mut()
+                            .unwrap()
+                            .children
+                            .push(id);
                         deltas.entry(parent).or_default().merge(&Delta {
                             bytes,
                             opened: pending,
@@ -182,17 +334,18 @@ impl ScanResults {
             }
             node.size_overflow |= delta.overflow || node.bytes.checked_add(delta.bytes).is_none();
             node.bytes = node.bytes.saturating_add(delta.bytes);
-            node.pending_directories += delta.opened;
-            node.pending_directories -= delta.closed;
-            node.errors += delta.errors;
-            if let Some(parent) = node.parent {
+            let directory = node.directory.as_mut().unwrap();
+            directory.pending += delta.opened;
+            directory.pending -= delta.closed;
+            directory.errors += delta.errors;
+            if let Some(parent) = node.parent() {
                 deltas.entry(parent).or_default().merge(&delta);
             }
         }
         if let Some(root) = self.nodes.first().filter(|node| node.size_overflow) {
             if !already_overflowed {
                 self.issues.push(ScanIssue {
-                    path: root.path.as_ref().clone(),
+                    path: root.path.to_path_buf(),
                     message:
                         "已分配空间总量超出 u64 统计范围，已停止将溢出目录的大小与占比视为精确值。"
                             .into(),

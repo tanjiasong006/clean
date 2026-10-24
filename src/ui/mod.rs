@@ -278,14 +278,18 @@ impl AppView {
     fn refresh_visible(&mut self) {
         self.last_refresh = Instant::now();
         self.visible_dirty = false;
-        self.visible = match self.page {
+        match self.page {
             Page::Directory => {
                 self.directory_index.select(&self.results, self.directory);
-                self.directory_index.sorted()
+                self.directory_index.write_sorted(&mut self.visible);
             }
-            Page::LargeFiles => self.large_files.matching(self.minimum_bytes),
-            Page::Issues => Vec::new(),
-        };
+            Page::LargeFiles => self.large_files.write_matching(
+                &self.results,
+                self.minimum_bytes,
+                &mut self.visible,
+            ),
+            Page::Issues => self.visible.clear(),
+        }
     }
 
     fn show_page(&mut self, page: Page, cx: &mut Context<Self>) {
@@ -309,7 +313,7 @@ impl AppView {
     fn open_parent(&mut self) {
         if self.page == Page::LargeFiles
             && let Some(id) = self.selected()
-            && let Some(parent) = self.results.nodes[id].parent
+            && let Some(parent) = self.results.nodes[id].parent()
         {
             self.navigate_to(parent, true);
             self.views.entry(parent).or_default().selected = Some(id);
@@ -339,7 +343,7 @@ impl AppView {
         if self.revealing {
             return;
         }
-        let path = self.results.nodes[id].path.clone();
+        let path = self.results.nodes[id].path.to_path_buf();
         self.revealing = true;
         self.notice = None;
         cx.spawn(async move |this, cx| {
@@ -361,7 +365,7 @@ impl AppView {
 
     fn entry_description(&self, id: NodeId) -> String {
         let node = &self.results.nodes[id];
-        if let Some(owner) = node.hard_link_to {
+        if let Some(owner) = node.hard_link_to() {
             return format!(
                 "硬链接 · 已计入 {}",
                 self.results.nodes[owner].path.display()
@@ -374,9 +378,9 @@ impl AppView {
             EntryKind::Symlink => "符号链接 · 已跳过",
             EntryKind::Other => "特殊文件 · 已跳过",
             EntryKind::Directory if node.size_overflow => "已分配空间超出统计范围",
-            EntryKind::Directory if node.errors > 0 => "含读取失败项",
+            EntryKind::Directory if node.errors() > 0 => "含读取失败项",
             EntryKind::Directory if !node.is_complete() => "尚未扫描完整",
-            EntryKind::Directory if node.children.is_empty() => "空目录",
+            EntryKind::Directory if node.children().is_empty() => "空目录",
             EntryKind::Directory => "目录 · 双击进入",
             EntryKind::File => "文件",
         };
@@ -385,7 +389,7 @@ impl AppView {
 
     fn entry_size(&self, id: NodeId) -> String {
         let node = &self.results.nodes[id];
-        if node.hard_link_to.is_some() {
+        if node.hard_link_to().is_some() {
             "已去重".into()
         } else if node.size_overflow {
             "超出范围".into()
@@ -409,7 +413,7 @@ impl AppView {
         let name = node
             .path
             .file_name()
-            .unwrap_or(node.path.as_os_str())
+            .unwrap_or(node.path.name())
             .to_string_lossy()
             .into_owned();
         let description = self.entry_description(id);
@@ -509,7 +513,7 @@ impl Render for AppView {
         let mut ancestor = current.map(|_| self.directory);
         while let Some(id) = ancestor {
             ancestors.push(id);
-            ancestor = self.results.nodes[id].parent;
+            ancestor = self.results.nodes[id].parent();
         }
         ancestors.reverse();
         let selected = self.selected();
@@ -727,7 +731,7 @@ impl Render for AppView {
                 "扫描根目录".to_string()
             } else {
                 path.file_name()
-                    .unwrap_or(path.as_os_str())
+                    .unwrap_or(path.name())
                     .to_string_lossy()
                     .into_owned()
             };
@@ -856,7 +860,7 @@ impl Render for AppView {
                     .on_click(cx.listener(move |_, _, _, cx| {
                         if let Some(path) = &selected_path {
                             cx.write_to_clipboard(ClipboardItem::new_string(
-                                path.to_string_lossy().into_owned(),
+                                path.display().to_string(),
                             ));
                         }
                     })),

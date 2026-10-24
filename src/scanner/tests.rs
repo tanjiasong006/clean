@@ -69,7 +69,7 @@ fn node<'a>(results: &'a ScanResults, path: &Path) -> &'a crate::models::Node {
     results
         .nodes
         .iter()
-        .find(|node| node.path.as_ref() == path)
+        .find(|node| node.path.to_path_buf() == path)
         .unwrap()
 }
 
@@ -84,14 +84,14 @@ fn allocated(path: &Path) -> u64 {
 fn assert_allocated_totals(results: &ScanResults) {
     for node in &results.nodes {
         let own = if matches!(node.kind, EntryKind::File | EntryKind::Directory)
-            && node.hard_link_to.is_none()
+            && node.hard_link_to().is_none()
         {
-            allocated(&node.path)
+            allocated(&node.path.to_path_buf())
         } else {
             0
         };
         let children: u64 = node
-            .children
+            .children()
             .iter()
             .map(|id| results.nodes[*id].bytes)
             .sum();
@@ -114,16 +114,16 @@ fn aggregates_nested_directories_and_sorts_by_allocated_space() {
     assert!(results.nodes.iter().all(|node| node.is_complete()));
     let children = sorted_children(&results, 0);
     assert_eq!(
-        results.nodes[children[0]].path.as_ref(),
-        &temp.0.join("nested")
+        results.nodes[children[0]].path.to_path_buf(),
+        temp.0.join("nested")
     );
     assert_eq!(
-        results.nodes[children[1]].path.as_ref(),
-        &temp.0.join("small")
+        results.nodes[children[1]].path.to_path_buf(),
+        temp.0.join("small")
     );
     assert_eq!(
-        results.nodes[children[2]].path.as_ref(),
-        &temp.0.join("empty")
+        results.nodes[children[2]].path.to_path_buf(),
+        temp.0.join("empty")
     );
     assert!(results.issues.is_empty());
 }
@@ -171,7 +171,7 @@ fn hard_links_are_counted_once_across_directories_and_keep_all_paths() {
         .nodes
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.kind == EntryKind::File && node.hard_link_to.is_none())
+        .filter(|(_, node)| node.kind == EntryKind::File && node.hard_link_to().is_none())
         .collect();
     assert_eq!(owners.len(), 1);
     let (owner_id, owner) = owners[0];
@@ -180,9 +180,9 @@ fn hard_links_are_counted_once_across_directories_and_keep_all_paths() {
         .nodes
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.hard_link_to.is_some())
+        .filter(|(_, node)| node.hard_link_to().is_some())
     {
-        assert_eq!(link.hard_link_to, Some(owner_id));
+        assert_eq!(link.hard_link_to(), Some(owner_id));
         assert!(owner_id < id);
         assert_eq!(link.bytes, 0);
     }
@@ -335,7 +335,7 @@ fn unreadable_directory_is_reported_separately_and_is_never_empty() {
     assert_eq!(results.issues.len(), 1);
     assert_eq!(results.issues[0].path, blocked);
     assert!(!node(&results, &blocked).is_complete());
-    assert_eq!(node(&results, &blocked).errors, 1);
+    assert_eq!(node(&results, &blocked).errors(), 1);
     assert!(!results.nodes[0].is_complete());
 }
 
@@ -483,7 +483,7 @@ fn queued_directory_replacements_are_incomplete_and_never_read() {
         assert_eq!(results.nodes[0].bytes, expected);
         assert_eq!(results.issues.len(), 1);
         assert!(!node(&results, &temp.0.join("queued")).is_complete());
-        assert!(node(&results, &temp.0.join("queued")).children.is_empty());
+        assert!(node(&results, &temp.0.join("queued")).children().is_empty());
     }
 }
 
@@ -739,7 +739,7 @@ fn large_directory_worker_pipeline() {
     assert!(results.nodes.iter().all(|node| node.is_complete()));
     assert!(results.issues.is_empty());
     assert_eq!(directory.sorted(), sorted_children(&results, 0));
-    assert_eq!(files.matching(0).len(), FILES);
+    assert_eq!(files.matching(&results, 0).len(), FILES);
     println!(
         "{FILES} files, {batches} bounded batches, scan + aggregation + indexes: {elapsed:?} ({:.0} files/s)",
         FILES as f64 / elapsed.as_secs_f64()
@@ -894,14 +894,14 @@ fn hard_link_deduplication_survives_worker_batch_boundaries() {
         allocated(&temp.0) + allocated(&original)
     );
     assert_allocated_totals(&results);
-    let owners = files.matching(0);
+    let owners = files.matching(&results, 0);
     assert_eq!(owners.len(), 1);
     for node in results
         .nodes
         .iter()
-        .filter(|node| node.hard_link_to.is_some())
+        .filter(|node| node.hard_link_to().is_some())
     {
-        assert_eq!(node.hard_link_to, Some(owners[0]));
+        assert_eq!(node.hard_link_to(), Some(owners[0]));
     }
     assert_eq!(directory.sorted().len(), 301);
     assert_eq!(directory.sorted(), sorted_children(&results, 0));

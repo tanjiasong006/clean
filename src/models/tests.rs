@@ -61,10 +61,10 @@ impl Reference {
             assert_eq!(
                 self.nodes[id],
                 (
-                    node.parent,
+                    node.parent(),
                     node.bytes,
-                    node.pending_directories,
-                    node.errors
+                    node.pending_directories(),
+                    node.errors()
                 ),
                 "node {id}"
             );
@@ -158,9 +158,9 @@ fn batched_aggregation_matches_per_event_oracle_at_every_boundary() {
             results
                 .nodes
                 .iter()
-                .all(|node| node.pending_directories == 0)
+                .all(|node| node.pending_directories() == 0)
         );
-        assert!(results.nodes[0].errors > 0);
+        assert!(results.nodes[0].errors() > 0);
     }
 }
 
@@ -247,8 +247,8 @@ fn unfinished_subtrees_and_read_failures_stay_incomplete_in_the_same_batch() {
         ScanEvent::DirectoryRead(2),
         ScanEvent::Finished(ScanState::Partial),
     ]);
-    assert_eq!(results.nodes[0].pending_directories, 1);
-    assert_eq!(results.nodes[0].errors, 1);
+    assert_eq!(results.nodes[0].pending_directories(), 1);
+    assert_eq!(results.nodes[0].errors(), 1);
     assert!(!results.nodes[0].is_complete());
     assert!(!results.nodes[1].is_complete());
     assert!(!results.nodes[2].is_complete());
@@ -396,10 +396,104 @@ fn directory_allocation_and_hard_link_ownership_survive_batch_boundaries() {
         assert_eq!(results.nodes[0].bytes, 512 + 4096 + 1024);
         assert_eq!(results.nodes[2].bytes, 1024);
         assert_eq!(results.nodes[3].bytes, 0);
-        assert_eq!(results.nodes[3].hard_link_to, Some(1));
+        assert_eq!(results.nodes[3].hard_link_to(), Some(1));
         assert_eq!(results.files, 2);
         assert_eq!(results.hard_links, 1);
         assert!(results.nodes.iter().all(|node| node.is_complete()));
         assert!(results.issues.is_empty());
+    }
+}
+
+#[test]
+fn nodes_share_ancestor_names_and_reconstruct_exact_paths() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let root = PathBuf::from("/root/long/shared/prefix/");
+    let name = OsString::from_vec(b"file-\xff".to_vec());
+    let expected = [
+        root.clone(),
+        root.join("nested"),
+        root.join("nested").join(&name),
+    ];
+    let mut results = ScanResults::default();
+    for (id, path) in expected.iter().enumerate() {
+        results.apply(ScanEvent::Entry {
+            path: path.clone(),
+            parent: id.checked_sub(1),
+            kind: if id == 2 {
+                EntryKind::File
+            } else {
+                EntryKind::Directory
+            },
+            bytes: 512,
+            hard_link_to: None,
+        });
+    }
+    for (id, path) in expected.iter().enumerate() {
+        assert_eq!(results.nodes[id].path.to_path_buf(), *path);
+    }
+    assert_eq!(results.nodes[2].path.name(), name);
+    assert_eq!(results.nodes[2].path.file_name(), Some(name.as_os_str()));
+    assert!(Arc::ptr_eq(
+        results.nodes[2].path.parent.as_ref().unwrap(),
+        &results.nodes[1].path,
+    ));
+    assert!(results.nodes[2].directory.is_none());
+    assert!(results.nodes[2].children().is_empty());
+    assert_eq!(results.nodes[2].pending_directories(), 0);
+    assert_eq!(results.nodes[2].errors(), 0);
+    assert!(results.nodes[2].is_complete());
+    #[cfg(target_pointer_width = "64")]
+    assert!(std::mem::size_of::<Node>() <= 48);
+}
+
+#[test]
+fn shared_path_order_matches_filesystem_path_order_across_ancestors_and_trees() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let names = [
+        OsString::from("a"),
+        OsString::from("a-"),
+        OsString::from("z"),
+        OsString::from("中文"),
+        OsString::from_vec(b"non-utf8-\xff".to_vec()),
+    ];
+    let mut results = ScanResults::default();
+    let mut expected: Vec<PathBuf> = Vec::new();
+    let mut seed = 73_u64;
+    for id in 0_usize..256 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let parent = id.checked_sub(1).map(|_| seed as usize % id);
+        let path = parent.map_or_else(
+            || PathBuf::from("/root/./shared/"),
+            |parent| expected[parent].join(&names[id % names.len()]),
+        );
+        expected.push(path.clone());
+        results.apply(ScanEvent::Entry {
+            path,
+            parent,
+            kind: EntryKind::Directory,
+            bytes: 0,
+            hard_link_to: None,
+        });
+    }
+    for (a, left) in results.nodes.iter().enumerate() {
+        for (b, right) in results.nodes.iter().enumerate() {
+            assert_eq!(
+                left.path.cmp(&right.path),
+                expected[a].cmp(&expected[b]),
+                "{a}, {b}"
+            );
+        }
+    }
+    let alternate = NodePath {
+        parent: None,
+        name: expected[127].clone().into_os_string().into_boxed_os_str(),
+    };
+    for (id, node) in results.nodes.iter().enumerate() {
+        assert_eq!(
+            node.path.as_ref().cmp(&alternate),
+            expected[id].cmp(&expected[127])
+        );
     }
 }
