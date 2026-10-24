@@ -521,7 +521,7 @@ fn path_order_matches_filesystem_order_across_ancestors_and_trees() {
 }
 
 #[test]
-fn directory_names_share_a_prefix_without_changing_lookups() {
+fn repeated_names_share_one_dictionary_entry() {
     let mut results = ScanResults::default();
     results.apply_batch([
         ScanEvent::Entry {
@@ -532,38 +532,95 @@ fn directory_names_share_a_prefix_without_changing_lookups() {
             hard_link_to: None,
         },
         ScanEvent::Entry {
-            path: "/root/build-alpha".into(),
+            path: "/root/a".into(),
+            parent: Some(0),
+            kind: EntryKind::Directory,
+            bytes: 0,
+            hard_link_to: None,
+        },
+        ScanEvent::Entry {
+            path: "/root/b".into(),
+            parent: Some(0),
+            kind: EntryKind::Directory,
+            bytes: 0,
+            hard_link_to: None,
+        },
+        ScanEvent::Entry {
+            path: "/root/a/shared-name".into(),
+            parent: Some(1),
+            kind: EntryKind::File,
+            bytes: 512,
+            hard_link_to: None,
+        },
+        ScanEvent::Entry {
+            path: "/root/b/shared-name".into(),
+            parent: Some(2),
+            kind: EntryKind::File,
+            bytes: 1024,
+            hard_link_to: None,
+        },
+        ScanEvent::Entry {
+            path: "/root/b/other".into(),
+            parent: Some(2),
+            kind: EntryKind::File,
+            bytes: 0,
+            hard_link_to: None,
+        },
+    ]);
+    // "/root", "a", "shared-name", "b", "other": the repeated name is stored once.
+    assert_eq!(results.unique_names(), 5);
+    assert_eq!(
+        results.stored_name_bytes(),
+        "/root".len() + "a".len() + "shared-name".len() + "b".len() + "other".len()
+    );
+    assert_eq!(results.name_id(3), results.name_id(4));
+    assert_ne!(results.name_id(3), results.name_id(5));
+    assert_eq!(results.name(4).to_string_lossy(), "shared-name");
+    assert_eq!(results.name_bytes(4), &b"shared-name"[..]);
+    assert_eq!(results.to_path_buf(4), PathBuf::from("/root/b/shared-name"));
+}
+
+#[test]
+fn long_names_intern_exactly_across_the_length_byte_boundary() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let boundary = OsString::from_vec(vec![b'y'; 255]);
+    let longer = OsString::from_vec((0..300).map(|index| b'a' + index as u8 % 26).collect());
+    let mut results = ScanResults::default();
+    results.apply_batch([
+        ScanEvent::Entry {
+            path: "/root".into(),
+            parent: None,
+            kind: EntryKind::Directory,
+            bytes: 0,
+            hard_link_to: None,
+        },
+        ScanEvent::Entry {
+            path: std::path::Path::new("/root").join(&boundary),
             parent: Some(0),
             kind: EntryKind::File,
             bytes: 512,
             hard_link_to: None,
         },
         ScanEvent::Entry {
-            path: "/root/build-beta".into(),
+            path: std::path::Path::new("/root").join(&longer),
             parent: Some(0),
             kind: EntryKind::File,
-            bytes: 1024,
+            bytes: 512,
             hard_link_to: None,
         },
         ScanEvent::Entry {
-            path: "/root/build-gamma".into(),
+            path: std::path::Path::new("/root").join(&longer),
             parent: Some(0),
             kind: EntryKind::File,
-            bytes: 0,
+            bytes: 512,
             hard_link_to: None,
         },
     ]);
-    let before = results.names.len();
-    results.apply(ScanEvent::DirectoryRead(0));
-    let after = results.names.len();
-    // "build-" leaves the per-name arena and is stored once for the directory.
-    assert_eq!(before - after, 3 * "build-".len());
-    assert_eq!(results.prefixes.len(), "build-".len());
-    assert_eq!(results.name(1).to_string_lossy(), "build-alpha");
-    assert_eq!(results.name(2).to_string_lossy(), "build-beta");
-    assert_eq!(results.name(3).to_string_lossy(), "build-gamma");
-    assert_eq!(results.to_path_buf(1), PathBuf::from("/root/build-alpha"));
-    assert_eq!(results.name_suffix(1), &b"alpha"[..]);
+    assert_eq!(results.unique_names(), 3);
+    assert_eq!(results.name(1).to_os_string(), boundary);
+    assert_eq!(results.name(2).to_os_string(), longer);
+    assert_eq!(results.name_id(2), results.name_id(3));
 }
 
 #[test]

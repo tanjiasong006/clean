@@ -31,13 +31,13 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Children of one directory share a name prefix, so their suffixes alone give
-/// path order. Sizes are compared as 64-bit so escaped values stay exact.
+/// Sizes are compared as 64-bit so escaped values stay exact, then names give
+/// path order.
 fn compare_siblings(results: &ScanResults, left: NodeId, right: NodeId) -> Ordering {
     results
         .bytes(right)
         .cmp(&results.bytes(left))
-        .then_with(|| results.name_suffix(left).cmp(&results.name_suffix(right)))
+        .then_with(|| results.name_bytes(left).cmp(&results.name_bytes(right)))
         .then_with(|| left.cmp(&right))
 }
 

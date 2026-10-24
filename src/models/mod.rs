@@ -1,6 +1,7 @@
-//! Compact scan results. A node is eight bytes: a name offset and a packed
-//! kind/payload word. Names live in chunked arenas; directory metadata lives in
-//! a separate table. Entries of one directory must be emitted contiguously so
+//! Compact scan results. A node is eight bytes: a dictionary id for its name
+//! and a packed kind/payload word. Names are interned by content, so a name
+//! repeated anywhere in the scan is stored once; directory metadata lives in a
+//! separate table. Entries of one directory must be emitted contiguously so
 //! that a child's parent is found from the directory's child range.
 
 use std::{
@@ -61,13 +62,18 @@ const BLOCK_SIZE: u64 = 512;
 const MAX_INLINE_BLOCKS: u64 = PAYLOAD_MASK as u64;
 const MAX_DIRECTORIES: usize = PAYLOAD_MASK as usize;
 
-const NO_PREFIX: u8 = u8::MAX;
 const NAME_CHUNK: usize = 1 << 20;
 const NODE_CHUNK: usize = 1 << 16;
 const INDEX_CHUNK: usize = 1 << 16;
+/// Names are grouped so a dictionary entry's arena offset can be found without
+/// storing four bytes of offset for every entry.
+const NAME_BLOCK: usize = 32;
+/// A dictionary length byte; entries that long keep their length in a side map.
+const LONG_NAME: u8 = u8::MAX;
 
 #[derive(Clone, Copy, Debug)]
 struct Node {
+    /// Dictionary id of the entry's name.
     name: u32,
     info: u32,
 }
@@ -171,18 +177,135 @@ impl NameArena {
         }
     }
 
-    fn truncate(&mut self, end: usize) {
-        let index = end / NAME_CHUNK;
-        let within = end % NAME_CHUNK;
-        if index >= self.chunks.len() {
-            return;
+    fn shrink_to_fit(&mut self) {
+        if let Some(last) = self.chunks.last_mut() {
+            last.shrink_to_fit();
         }
-        if within == 0 {
-            self.chunks.truncate(index);
+    }
+}
+
+fn hash_name(name: &[u8]) -> u64 {
+    // FNV-1a: cheap over short names and adequate for open addressing.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for &byte in name {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Interned entry names. Each distinct name is stored once; a node holds its
+/// dictionary id. Lengths are one byte per entry and every 32nd name records an
+/// arena offset, so the index costs about 1.1 bytes per distinct name instead
+/// of a four-byte offset each. The lookup table only exists while scanning.
+#[derive(Default)]
+struct NameDict {
+    bytes: NameArena,
+    lengths: Vec<u8>,
+    block_offsets: Vec<u32>,
+    long_lengths: HashMap<u32, u32>,
+    table: Vec<u32>,
+}
+
+impl NameDict {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lengths.len()
+    }
+
+    #[cfg(test)]
+    fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn intern(&mut self, name: &[u8]) -> u32 {
+        if self.table.is_empty() {
+            self.table = vec![0; 1024];
+        }
+        if self.lengths.len() * 4 >= self.table.len() * 3 {
+            self.grow();
+        }
+        let mask = self.table.len() - 1;
+        let mut index = hash_name(name) as usize & mask;
+        loop {
+            let slot = self.table[index];
+            if slot == 0 {
+                break;
+            }
+            let id = slot - 1;
+            if &*self.read(id) == name {
+                return id;
+            }
+            index = (index + 1) & mask;
+        }
+        let id = self.push(name);
+        self.table[index] = id + 1;
+        id
+    }
+
+    fn read(&self, id: u32) -> Cow<'_, [u8]> {
+        let (offset, length) = self.range(id);
+        self.bytes.read(offset, length)
+    }
+
+    fn range(&self, id: u32) -> (usize, usize) {
+        let id = id as usize;
+        let block = id / NAME_BLOCK;
+        let mut offset = self.block_offsets[block] as usize;
+        for previous in block * NAME_BLOCK..id {
+            offset += self.length(previous as u32) as usize;
+        }
+        (offset, self.length(id as u32) as usize)
+    }
+
+    fn length(&self, id: u32) -> u32 {
+        match self.lengths[id as usize] {
+            LONG_NAME => self.long_lengths[&id],
+            length => length as u32,
+        }
+    }
+
+    fn push(&mut self, name: &[u8]) -> u32 {
+        let id = self.lengths.len();
+        assert!(
+            id < u32::MAX as usize,
+            "scan contains too many unique names"
+        );
+        if id.is_multiple_of(NAME_BLOCK) {
+            self.block_offsets.push(self.bytes.len() as u32);
+        }
+        self.bytes.push(name);
+        if name.len() < LONG_NAME as usize {
+            self.lengths.push(name.len() as u8);
         } else {
-            self.chunks[index].truncate(within);
-            self.chunks.truncate(index + 1);
+            self.lengths.push(LONG_NAME);
+            self.long_lengths.insert(id as u32, name.len() as u32);
         }
+        id as u32
+    }
+
+    fn grow(&mut self) {
+        let capacity = (self.table.len() * 2).max(1024);
+        let mut table = vec![0; capacity];
+        let mask = capacity - 1;
+        for id in 0..self.lengths.len() as u32 {
+            let (offset, length) = self.range(id);
+            let mut index = hash_name(&self.bytes.read(offset, length)) as usize & mask;
+            while table[index] != 0 {
+                index = (index + 1) & mask;
+            }
+            table[index] = id + 1;
+        }
+        self.table = table;
+    }
+
+    fn finish(&mut self) {
+        // Interning is over; only the compact dictionary stays resident.
+        self.table = Vec::new();
+        self.long_lengths.shrink_to_fit();
+        self.lengths.shrink_to_fit();
+        self.block_offsets.shrink_to_fit();
+        self.bytes.shrink_to_fit();
     }
 }
 
@@ -209,40 +332,24 @@ fn os_string_from_bytes(bytes: Vec<u8>) -> OsString {
     OsString::from_vec(bytes)
 }
 
-/// A node's full name, split into the directory's shared prefix and the
-/// per-entry suffix. Both parts borrow the arena unless a name spans chunks.
+/// A node's name, borrowed from the shared name dictionary unless it spans
+/// arena chunks.
 #[derive(Clone, Debug)]
 pub struct NodeName<'a> {
-    prefix: Cow<'a, [u8]>,
-    suffix: Cow<'a, [u8]>,
+    bytes: Cow<'a, [u8]>,
 }
 
-impl<'a> NodeName<'a> {
+impl NodeName<'_> {
     pub fn to_string_lossy(&self) -> Cow<'_, str> {
-        if self.prefix.is_empty() {
-            return String::from_utf8_lossy(&self.suffix);
-        }
-        let mut bytes = Vec::with_capacity(self.prefix.len() + self.suffix.len());
-        bytes.extend_from_slice(&self.prefix);
-        bytes.extend_from_slice(&self.suffix);
-        Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+        String::from_utf8_lossy(&self.bytes)
     }
 
     pub fn to_os_string(&self) -> OsString {
-        if self.prefix.is_empty() {
-            return os_string_from_bytes(self.suffix.to_vec());
-        }
-        let mut bytes = Vec::with_capacity(self.prefix.len() + self.suffix.len());
-        bytes.extend_from_slice(&self.prefix);
-        bytes.extend_from_slice(&self.suffix);
-        os_string_from_bytes(bytes)
+        os_string_from_bytes(self.bytes.to_vec())
     }
 
     pub fn bytes(&self) -> impl Iterator<Item = u8> + '_ {
-        self.prefix
-            .iter()
-            .copied()
-            .chain(self.suffix.iter().copied())
+        self.bytes.iter().copied()
     }
 }
 
@@ -297,8 +404,7 @@ pub enum ScanEvent {
 pub struct ScanResults {
     pub state: ScanState,
     nodes: Vec<Node>,
-    names: NameArena,
-    prefixes: NameArena,
+    names: NameDict,
     directory_data: Vec<DirectoryData>,
     /// Directory ordinals ordered by `first_child`. Every non-root node id
     /// falls in exactly one directory's contiguous child range.
@@ -319,9 +425,7 @@ struct DirectoryData {
     child_count: u32,
     pending: u32,
     node: u32,
-    prefix_offset: u32,
     errors: u16,
-    prefix_len: u8,
     overflow: bool,
 }
 
@@ -333,9 +437,7 @@ impl DirectoryData {
             child_count: 0,
             pending: 1,
             node: node as u32,
-            prefix_offset: 0,
             errors: 0,
-            prefix_len: NO_PREFIX,
             overflow: false,
         }
     }
@@ -456,42 +558,29 @@ impl ScanResults {
         }
     }
 
-    fn name_bounds(&self, id: NodeId) -> (usize, usize) {
-        let start = self.nodes[id].name as usize;
-        let end = match self.nodes.get(id + 1) {
-            Some(next) => next.name as usize,
-            None => self.names.len(),
-        };
-        debug_assert!(end >= start, "names must be stored in node order");
-        (start, end - start)
-    }
-
-    fn prefix(&self, ordinal: usize) -> Cow<'_, [u8]> {
-        let directory = &self.directory_data[ordinal];
-        if directory.prefix_len == NO_PREFIX || directory.prefix_len == 0 {
-            return Cow::Borrowed(&[][..]);
-        }
-        self.prefixes.read(
-            directory.prefix_offset as usize,
-            directory.prefix_len as usize,
-        )
-    }
-
-    pub fn name_suffix(&self, id: NodeId) -> Cow<'_, [u8]> {
-        let (start, len) = self.name_bounds(id);
-        self.names.read(start, len)
+    pub fn name_bytes(&self, id: NodeId) -> Cow<'_, [u8]> {
+        self.names.read(self.nodes[id].name)
     }
 
     pub fn name(&self, id: NodeId) -> NodeName<'_> {
-        let suffix = self.name_suffix(id);
-        let prefix = match self.parent(id) {
-            Some(parent) => match self.directory_ordinal(parent) {
-                Some(ordinal) => self.prefix(ordinal),
-                None => Cow::Borrowed(&[][..]),
-            },
-            None => Cow::Borrowed(&[][..]),
-        };
-        NodeName { prefix, suffix }
+        NodeName {
+            bytes: self.name_bytes(id),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn unique_names(&self) -> usize {
+        self.names.len()
+    }
+
+    #[cfg(test)]
+    pub fn stored_name_bytes(&self) -> usize {
+        self.names.byte_len()
+    }
+
+    #[cfg(test)]
+    pub fn name_id(&self, id: NodeId) -> u32 {
+        self.nodes[id].name
     }
 
     pub fn path(&self, id: NodeId) -> NodePath {
@@ -574,7 +663,7 @@ impl ScanResults {
                     } else {
                         path.as_os_str()
                     };
-                    let name = self.names.push(&os_bytes(name));
+                    let name = self.names.intern(&os_bytes(name));
                     let pending = usize::from(kind == EntryKind::Directory);
                     self.hard_links += usize::from(hard_link_to.is_some());
                     match kind {
@@ -625,7 +714,6 @@ impl ScanResults {
                     if node.kind() != EntryKind::Directory {
                         continue;
                     }
-                    self.compress_children(node.ordinal());
                     deltas.entry(id).or_default().closed += 1;
                 }
                 ScanEvent::Issue { parent, issue } => {
@@ -637,8 +725,10 @@ impl ScanResults {
                 ScanEvent::Finished(state) => {
                     self.state = state;
                     // Traversal is over, so capacity reserved while growing is
-                    // dead weight: the directory table halves to its actual
-                    // occupancy and the alias tables drop unused buckets.
+                    // dead weight: the name dictionary drops its lookup table,
+                    // the directory table halves to its actual occupancy, and
+                    // the alias tables drop unused buckets.
+                    self.names.finish();
                     self.directory_data.shrink_to_fit();
                     self.by_first_child.shrink_to_fit();
                     self.escaped.shrink_to_fit();
@@ -727,64 +817,6 @@ impl ScanResults {
             );
         }
         directory.child_count += 1;
-    }
-
-    /// Stores the prefix shared by a directory's children once instead of on
-    /// every child name. The children's names are the most recently appended
-    /// bytes, so the run can be compacted and truncated in place.
-    fn compress_children(&mut self, ordinal: usize) {
-        let directory = &self.directory_data[ordinal];
-        if directory.prefix_len != NO_PREFIX || directory.child_count < 2 {
-            return;
-        }
-        let first = directory.first_child as usize;
-        let count = directory.child_count as usize;
-        let (first_start, first_len) = self.name_bounds(first);
-        if first_len == 0 {
-            self.directory_data[ordinal].prefix_len = 0;
-            return;
-        }
-        let first_name = self.names.read(first_start, first_len).into_owned();
-        let mut prefix = first_name.len();
-        for id in first + 1..first + count {
-            let (start, len) = self.name_bounds(id);
-            let name = self.names.read(start, len);
-            let limit = prefix.min(name.len());
-            let mut index = 0;
-            while index < limit && first_name[index] == name[index] {
-                index += 1;
-            }
-            prefix = index;
-            if prefix == 0 {
-                break;
-            }
-        }
-        let prefix = prefix.min(u8::MAX as usize);
-        if prefix == 0 {
-            self.directory_data[ordinal].prefix_len = 0;
-            return;
-        }
-        let run_start = self.nodes[first].name as usize;
-        let run_end = self.names.len();
-        let prefix_offset = self.prefixes.push(&first_name[..prefix]);
-        let mut cursor = run_start;
-        let mut buffer = vec![0; 1024];
-        for id in first..first + count {
-            let (source, length) = self.name_bounds(id);
-            let suffix = length - prefix;
-            if suffix > buffer.len() {
-                buffer.resize(suffix, 0);
-            }
-            self.names.read_into(source + prefix, &mut buffer[..suffix]);
-            self.names.write(cursor, &buffer[..suffix]);
-            self.nodes[id].name = cursor as u32;
-            cursor += suffix;
-        }
-        debug_assert_eq!(cursor, run_end - prefix * count);
-        self.names.truncate(cursor);
-        let directory = &mut self.directory_data[ordinal];
-        directory.prefix_offset = prefix_offset;
-        directory.prefix_len = prefix as u8;
     }
 }
 

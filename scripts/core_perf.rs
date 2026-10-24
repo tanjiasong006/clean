@@ -67,7 +67,7 @@ fn measure(depth: usize, indexes: bool) {
             let b = directory.id(index + 1);
             results.bytes(a) > results.bytes(b)
                 || (results.bytes(a) == results.bytes(b)
-                    && results.name_suffix(a) < results.name_suffix(b))
+                    && results.name_bytes(a) < results.name_bytes(b))
         }));
     }
     println!("{FILES} files, depth={depth}, indexes={indexes}: {elapsed:?}");
@@ -129,8 +129,29 @@ fn synthetic_size(id: usize) -> u64 {
     }
 }
 
-fn measure_memory(count: usize) {
-    println!("{count} files; requested heap only, not RSS");
+#[derive(Clone, Copy)]
+enum NamePattern {
+    /// Every entry has a distinct name: the dictionary's worst case.
+    Unique,
+    /// A mix with roughly the measured home-directory distinct ratio (~37%)
+    /// and average raw name length.
+    Repeated,
+}
+
+fn entry_name(pattern: NamePattern, id: usize) -> String {
+    match pattern {
+        NamePattern::Unique => format!("file-{id:09}"),
+        NamePattern::Repeated if id % 3 == 0 => format!("unique-{id:010}"),
+        NamePattern::Repeated => format!("com.apple.shared-cache-{:04}", id % 250_000),
+    }
+}
+
+fn measure_memory(count: usize, pattern: NamePattern) {
+    let label = match pattern {
+        NamePattern::Unique => "all names unique (dictionary worst case)",
+        NamePattern::Repeated => "repeated names (~40% distinct)",
+    };
+    println!("{count} files, {label}; requested heap only, not RSS");
     let prefix = PathBuf::from(format!("/root/{}", "d".repeat(100)));
     let baseline = LIVE_BYTES.load(Ordering::Relaxed);
     PEAK_BYTES.store(baseline, Ordering::Relaxed);
@@ -154,7 +175,7 @@ fn measure_memory(count: usize) {
                 identities.insert((1_u64, id as u64), id + 1);
             }
             ScanEvent::Entry {
-                path: prefix.join(format!("file-{id:09}")),
+                path: prefix.join(entry_name(pattern, id)),
                 parent: Some(0),
                 kind: EntryKind::File,
                 bytes: synthetic_size(id),
@@ -200,10 +221,11 @@ fn id_visible_refresh(first: usize) -> bool {
 fn main() {
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("--memory") {
-        measure_memory(
-            args.next()
-                .map_or(1_000_000, |count| count.parse().expect("file count")),
-        );
+        let count = args
+            .next()
+            .map_or(1_000_000, |count| count.parse().expect("file count"));
+        measure_memory(count, NamePattern::Unique);
+        measure_memory(count, NamePattern::Repeated);
     } else {
         for _ in 0..3 {
             measure(0, true);
