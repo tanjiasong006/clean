@@ -26,6 +26,10 @@ use crate::{
     scanner::ScanJob,
 };
 
+mod appearance;
+
+use appearance::Appearance;
+
 const ROW_HEIGHT: f32 = 44.0;
 const SMALL_ROW_HEIGHT: f32 = 30.0;
 const INSPECTOR_WIDTH: f32 = 300.0;
@@ -90,6 +94,8 @@ pub struct AppView {
     last_clock: Instant,
     show_inspector: bool,
     focus_handle: Option<FocusHandle>,
+    appearance: Appearance,
+    appearance_subscription: Option<Subscription>,
 }
 
 impl Default for AppView {
@@ -122,16 +128,55 @@ impl Default for AppView {
             last_clock: Instant::now(),
             show_inspector: true,
             focus_handle: None,
+            appearance: Appearance::default(),
+            appearance_subscription: None,
         }
     }
 }
 
 impl AppView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut view = Self {
             focus_handle: Some(cx.focus_handle()),
             ..Self::default()
+        };
+        match Appearance::load() {
+            Ok(appearance) => view.appearance = appearance,
+            Err(error) => view.notice = Some(format!("无法读取外观偏好：{error}")),
         }
+        view.apply_appearance(window, cx);
+        view.appearance_subscription =
+            Some(cx.observe_window_appearance(window, |this, window, cx| {
+                if this.appearance == Appearance::System {
+                    this.apply_appearance(window, cx);
+                }
+            }));
+        view
+    }
+
+    fn apply_appearance(&self, window: &mut Window, cx: &mut Context<Self>) {
+        Theme::change(
+            self.appearance.resolve(window.appearance().into()),
+            Some(window),
+            cx,
+        );
+    }
+
+    fn set_appearance(
+        &mut self,
+        appearance: Appearance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.appearance == appearance {
+            return;
+        }
+        self.appearance = appearance;
+        self.apply_appearance(window, cx);
+        if let Err(error) = appearance.save() {
+            self.notice = Some(format!("主题已切换，但无法保存外观偏好：{error}"));
+        }
+        cx.notify();
     }
 
     fn start_scan(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -999,6 +1044,32 @@ impl AppView {
                     ),
             )
             .child(div().flex_1())
+            .child(
+                v_flex()
+                    .px_3()
+                    .py_3()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(theme.sidebar_border)
+                    .child(section_label("外观", theme.muted_foreground))
+                    .child(
+                        h_flex().gap_1().children(
+                            [Appearance::System, Appearance::Light, Appearance::Dark]
+                                .into_iter()
+                                .map(|appearance| {
+                                    let selected = self.appearance == appearance;
+                                    Button::new(appearance.name())
+                                        .with_size(Size::Small)
+                                        .label(appearance.label())
+                                        .when(selected, |button| button.secondary())
+                                        .when(!selected, |button| button.ghost())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.set_appearance(appearance, window, cx);
+                                        }))
+                                }),
+                        ),
+                    ),
+            )
             .child(
                 v_flex()
                     .px_3()

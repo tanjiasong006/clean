@@ -35,8 +35,7 @@ fn main() {
         };
 
         open_window(options, cx, |window, cx| {
-            component::Theme::sync_system_appearance(Some(window), cx);
-            cx.new(ui::AppView::new)
+            cx.new(|cx| ui::AppView::new(window, cx))
         })
         .expect("Failed to open the application window");
         cx.activate(true);

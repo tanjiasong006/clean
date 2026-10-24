@@ -60,6 +60,12 @@ pub fn reveal_in_finder(path: &Path) -> io::Result<()> {
     }
 }
 
+pub fn appearance_preference_path() -> std::io::Result<std::path::PathBuf> {
+    super::home_directory()
+        .map(|home| home.join("Library/Application Support/Clean/appearance"))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "无法获取主目录。"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
