@@ -623,6 +623,29 @@ fn long_names_intern_exactly_across_the_length_byte_boundary() {
 }
 
 #[test]
+fn directory_error_counts_are_not_truncated() {
+    let mut results = ScanResults::default();
+    results.apply(ScanEvent::Entry {
+        path: "/root".into(),
+        parent: None,
+        kind: EntryKind::Directory,
+        bytes: 0,
+        hard_link_to: None,
+    });
+    for index in 0..300 {
+        results.apply(ScanEvent::Issue {
+            parent: 0,
+            issue: ScanIssue {
+                path: format!("/root/denied-{index}").into(),
+                message: "permission denied".into(),
+            },
+        });
+    }
+    assert_eq!(results.errors(0), 300);
+    assert!(!results.is_complete(0));
+}
+
+#[test]
 fn files_above_the_inline_block_limit_keep_their_exact_size() {
     let sizes = [
         2 * 1024_u64 * 1024 * 1024 - 1024, // largest block count stored inline
@@ -654,6 +677,6 @@ fn files_above_the_inline_block_limit_keep_their_exact_size() {
 
 #[test]
 fn directory_records_stay_small() {
-    assert!(std::mem::size_of::<DirectoryData>() <= 32);
+    assert_eq!(std::mem::size_of::<DirectoryData>(), 24);
     assert_eq!(std::mem::size_of::<Node>(), 6);
 }

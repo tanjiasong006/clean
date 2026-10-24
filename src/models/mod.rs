@@ -67,6 +67,11 @@ const MAX_DIRECTORIES: usize = 1 << PAYLOAD_BITS;
 /// Nodes hold 24-bit dictionary ids.
 const MAX_NAMES: usize = 1 << 24;
 
+/// Directory records hold a read-error count and an overflow flag in a sparse
+/// map; both are rare, so the base record stays 24 bytes.
+const DIRECTORY_ERRORS_MASK: u32 = u16::MAX as u32;
+const DIRECTORY_OVERFLOW: u32 = 1 << 16;
+
 const NAME_CHUNK: usize = 1 << 20;
 const NODE_CHUNK: usize = 1 << 16;
 const INDEX_CHUNK: usize = 1 << 16;
@@ -451,6 +456,8 @@ pub struct ScanResults {
     /// falls in exactly one directory's contiguous child range.
     by_first_child: Vec<u32>,
     escaped: HashMap<NodeId, u64>,
+    /// Per-directory read-error count and overflow flag, keyed by ordinal.
+    directory_faults: HashMap<u32, u32>,
     hard_link_targets: HashMap<NodeId, NodeId>,
     pub issues: Vec<ScanIssue>,
     pub files: usize,
@@ -466,8 +473,6 @@ struct DirectoryData {
     child_count: u32,
     pending: u32,
     node: u32,
-    errors: u16,
-    overflow: bool,
 }
 
 impl DirectoryData {
@@ -478,8 +483,6 @@ impl DirectoryData {
             child_count: 0,
             pending: 1,
             node: node as u32,
-            errors: 0,
-            overflow: false,
         }
     }
 }
@@ -527,7 +530,7 @@ impl ScanResults {
 
     pub fn size_overflow(&self, id: NodeId) -> bool {
         match self.nodes[id].kind() {
-            EntryKind::Directory => self.directory_data[self.nodes[id].ordinal()].overflow,
+            EntryKind::Directory => self.faults(self.nodes[id].ordinal()) & DIRECTORY_OVERFLOW != 0,
             _ => false,
         }
     }
@@ -535,6 +538,27 @@ impl ScanResults {
     fn directory_ordinal(&self, id: NodeId) -> Option<usize> {
         let node = self.nodes.get(id)?;
         (node.kind() == EntryKind::Directory).then(|| node.ordinal())
+    }
+
+    fn faults(&self, ordinal: usize) -> u32 {
+        self.directory_faults
+            .get(&(ordinal as u32))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn note_faults(&mut self, ordinal: usize, overflow: bool, errors: u32) {
+        if !overflow && errors == 0 {
+            return;
+        }
+        let faults = self.directory_faults.entry(ordinal as u32).or_default();
+        if overflow {
+            *faults |= DIRECTORY_OVERFLOW;
+        }
+        let errors = (*faults & DIRECTORY_ERRORS_MASK)
+            .saturating_add(errors.min(DIRECTORY_ERRORS_MASK))
+            .min(DIRECTORY_ERRORS_MASK);
+        *faults = (*faults & !DIRECTORY_ERRORS_MASK) | errors;
     }
 
     fn first_child(&self, ordinal: usize) -> usize {
@@ -585,16 +609,14 @@ impl ScanResults {
     }
 
     pub fn errors(&self, id: NodeId) -> usize {
-        self.directory_ordinal(id)
-            .map_or(0, |ordinal| self.directory_data[ordinal].errors as usize)
+        self.directory_ordinal(id).map_or(0, |ordinal| {
+            (self.faults(ordinal) & DIRECTORY_ERRORS_MASK) as usize
+        })
     }
 
     pub fn is_complete(&self, id: NodeId) -> bool {
         match self.directory_ordinal(id) {
-            Some(ordinal) => {
-                let directory = &self.directory_data[ordinal];
-                directory.pending == 0 && directory.errors == 0 && !directory.overflow
-            }
+            Some(ordinal) => self.directory_data[ordinal].pending == 0 && self.faults(ordinal) == 0,
             None => true,
         }
     }
@@ -684,10 +706,7 @@ impl ScanResults {
 
     pub fn apply_batch(&mut self, events: impl IntoIterator<Item = ScanEvent>) -> Vec<NodeChange> {
         let first_new = self.nodes.len();
-        let already_overflowed = self
-            .directory_data
-            .first()
-            .is_some_and(|root| root.overflow);
+        let already_overflowed = self.faults(0) & DIRECTORY_OVERFLOW != 0;
         let mut deltas: BTreeMap<NodeId, Delta> = BTreeMap::new();
         for event in events {
             match event {
@@ -773,6 +792,7 @@ impl ScanResults {
                     self.directory_data.shrink_to_fit();
                     self.by_first_child.shrink_to_fit();
                     self.escaped.shrink_to_fit();
+                    self.directory_faults.shrink_to_fit();
                     self.hard_link_targets.shrink_to_fit();
                     self.issues.shrink_to_fit();
                 }
@@ -797,25 +817,19 @@ impl ScanResults {
                     previous_bytes: Some(directory.bytes),
                 });
             }
-            directory.overflow |=
-                delta.overflow || directory.bytes.checked_add(delta.bytes).is_none();
+            let overflow = delta.overflow || directory.bytes.checked_add(delta.bytes).is_none();
             directory.bytes = directory.bytes.saturating_add(delta.bytes);
             directory.pending = directory
                 .pending
                 .saturating_add(delta.opened)
                 .saturating_sub(delta.closed);
-            directory.errors = directory
-                .errors
-                .saturating_add(delta.errors.min(u16::MAX as u32) as u16);
+            self.note_faults(ordinal, overflow, delta.errors);
             if let Some(parent) = parent {
                 deltas.entry(parent).or_default().merge(&delta);
             }
         }
-        if self
-            .directory_data
-            .first()
-            .is_some_and(|root| root.overflow && !already_overflowed)
-        {
+        let root_overflow = self.faults(0) & DIRECTORY_OVERFLOW != 0;
+        if root_overflow && !already_overflowed {
             let path = self.to_path_buf(0);
             self.issues.push(ScanIssue {
                 path,
@@ -824,12 +838,7 @@ impl ScanResults {
                         .into(),
             });
         }
-        if self
-            .directory_data
-            .first()
-            .is_some_and(|root| root.overflow)
-            && self.state == ScanState::Complete
-        {
+        if root_overflow && self.state == ScanState::Complete {
             self.state = ScanState::Partial;
         }
         changes.extend((first_new..self.nodes.len()).map(|id| NodeChange {
