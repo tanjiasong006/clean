@@ -8,8 +8,8 @@ use std::{
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, Sizable, Size, StyledExt, Theme,
-    button::{Button, ButtonVariants},
+    ActiveTheme, Icon, Sizable, Size, StyledExt, Theme,
+    button::ButtonVariants,
     h_flex,
     menu::{ContextMenuExt, PopupMenuItem},
     scroll::ScrollableElement,
@@ -27,8 +27,10 @@ use crate::{
 };
 
 mod appearance;
+mod design;
 
 use appearance::Appearance;
+use design::{Palette, button, radius, type_size};
 
 const ROW_HEIGHT: f32 = 44.0;
 const SMALL_ROW_HEIGHT: f32 = 30.0;
@@ -160,6 +162,7 @@ impl AppView {
             Some(window),
             cx,
         );
+        Theme::update(cx, design::apply);
     }
 
     fn set_appearance(
@@ -904,12 +907,13 @@ impl AppView {
 
     fn render_sidebar_entry(&self, entry: NavEntry, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let active = entry.active;
+        let palette = Palette::for_theme(&theme);
+        let active = entry.active && !entry.disabled;
         let disabled = entry.disabled;
         let badge = entry.badge;
         let action = entry.action.clone();
         let text_color = if disabled {
-            theme.muted_foreground.opacity(0.5)
+            palette.text_disabled
         } else if active {
             theme.sidebar_accent_foreground
         } else {
@@ -921,7 +925,7 @@ impl AppView {
             .w_full()
             .h(px(28.0))
             .px_2()
-            .rounded(px(6.0))
+            .rounded(px(radius::CONTROL))
             .flex()
             .items_center()
             .gap_2()
@@ -930,31 +934,28 @@ impl AppView {
             } else {
                 theme.transparent
             })
-            .text_size(px(12.5))
+            .text_size(px(type_size::BODY))
+            .font_medium()
             .text_color(text_color)
             .aria_label(entry.label.clone())
             .when(!disabled, |this| {
                 let action = action.clone();
                 this.cursor_pointer()
-                    .hover(|style| style.bg(theme.sidebar_accent))
+                    .hover(|style| style.bg(palette.hover))
+                    .active(|style| style.bg(palette.pressed))
                     .on_click(cx.listener(move |this, _, _, cx| match &action {
                         NavAction::Page(page) => this.show_page(*page, cx),
                         NavAction::Scan(path) => this.start_scan(path.clone(), cx),
                         NavAction::Choose => this.choose_directory(cx),
                     }))
             })
-            .child(div().w(px(2.0)).h(px(13.0)).rounded_full().bg(if active {
-                theme.chart_2
-            } else {
-                theme.transparent
-            }))
             .child(
                 Icon::new(entry.icon)
                     .with_size(px(14.0))
                     .text_color(if disabled {
-                        theme.muted_foreground.opacity(0.5)
+                        palette.text_disabled
                     } else if active {
-                        theme.sidebar_accent_foreground
+                        theme.chart_2
                     } else {
                         theme.muted_foreground
                     }),
@@ -966,8 +967,8 @@ impl AppView {
                     .px_1()
                     .rounded_full()
                     .bg(theme.muted)
-                    .text_size(px(10.0))
-                    .text_color(theme.muted_foreground)
+                    .text_size(px(type_size::CAPTION))
+                    .text_color(palette.text_tertiary)
                     .child(format_count(count))
             }))
             .into_any_element()
@@ -975,6 +976,7 @@ impl AppView {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let entries = self.sidebar_entries();
         let (analysis, scans): (Vec<_>, Vec<_>) = entries
             .into_iter()
@@ -986,8 +988,6 @@ impl AppView {
             .flex_shrink_0()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
             .child(
                 h_flex()
                     .px_3()
@@ -997,7 +997,7 @@ impl AppView {
                     .child(
                         div()
                             .size(px(28.0))
-                            .rounded(px(7.0))
+                            .rounded(px(radius::CONTROL))
                             .bg(theme.primary)
                             .flex()
                             .items_center()
@@ -1011,11 +1011,16 @@ impl AppView {
                     .child(
                         v_flex()
                             .gap_0()
-                            .child(div().text_size(px(14.0)).font_semibold().child("Clean"))
                             .child(
                                 div()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.muted_foreground)
+                                    .text_size(px(type_size::HEADING))
+                                    .font_semibold()
+                                    .child("Clean"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(type_size::CAPTION))
+                                    .text_color(palette.text_tertiary)
                                     .child("磁盘空间分析"),
                             ),
                     ),
@@ -1024,7 +1029,7 @@ impl AppView {
                 v_flex()
                     .px_2()
                     .gap_1()
-                    .child(section_label("分析", theme.muted_foreground))
+                    .child(section_label("分析", palette.text_tertiary))
                     .children(
                         analysis
                             .into_iter()
@@ -1036,7 +1041,7 @@ impl AppView {
                     .px_2()
                     .pt_4()
                     .gap_1()
-                    .child(section_label("扫描位置", theme.muted_foreground))
+                    .child(section_label("扫描位置", palette.text_tertiary))
                     .children(
                         scans
                             .into_iter()
@@ -1049,16 +1054,14 @@ impl AppView {
                     .px_3()
                     .py_3()
                     .gap_2()
-                    .border_t_1()
-                    .border_color(theme.sidebar_border)
-                    .child(section_label("外观", theme.muted_foreground))
+                    .child(section_label("外观", palette.text_tertiary))
                     .child(
                         h_flex().gap_1().children(
                             [Appearance::System, Appearance::Light, Appearance::Dark]
                                 .into_iter()
                                 .map(|appearance| {
                                     let selected = self.appearance == appearance;
-                                    Button::new(appearance.name())
+                                    button(appearance.name(), false, &theme)
                                         .with_size(Size::Small)
                                         .label(appearance.label())
                                         .when(selected, |button| button.secondary())
@@ -1075,19 +1078,17 @@ impl AppView {
                     .px_3()
                     .py_3()
                     .gap_1()
-                    .border_t_1()
-                    .border_color(theme.sidebar_border)
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(type_size::LABEL))
                             .text_color(theme.sidebar_foreground)
                             .truncate()
                             .child(self.root_label()),
                     )
                     .child(
                         div()
-                            .text_size(px(10.0))
-                            .text_color(theme.muted_foreground)
+                            .text_size(px(type_size::CAPTION))
+                            .text_color(palette.text_tertiary)
                             .child("只读分析 · 不修改文件"),
                     ),
             )
@@ -1096,6 +1097,7 @@ impl AppView {
 
     fn render_topbar(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let scanning = self.results.state == ScanState::Scanning;
         let root = self
             .scan_root
@@ -1104,7 +1106,8 @@ impl AppView {
             .unwrap_or_else(|| "选择位置开始分析".into());
 
         let action = if scanning {
-            Button::new("stop-scan")
+            button("stop-scan", self.cancelling, &theme)
+                .secondary()
                 .with_size(Size::Small)
                 .label(if self.cancelling {
                     "正在停止…"
@@ -1112,7 +1115,6 @@ impl AppView {
                     "停止扫描"
                 })
                 .icon(IconName::Square)
-                .disabled(self.cancelling)
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Some(job) = &this.job {
                         job.cancel();
@@ -1123,11 +1125,11 @@ impl AppView {
                 .into_any_element()
         } else {
             let root_path = self.scan_root.clone();
-            Button::new("rescan")
+            button("rescan", root_path.is_none() || self.choosing, &theme)
+                .secondary()
                 .with_size(Size::Small)
                 .label("重新扫描")
                 .icon(IconName::RotateCw)
-                .disabled(root_path.is_none() || self.choosing)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(path) = &root_path {
                         if let Some(job) = &this.job {
@@ -1142,10 +1144,9 @@ impl AppView {
 
         h_flex()
             .h(px(52.0))
+            .bg(palette.toolbar)
             .px_4()
             .gap_3()
-            .border_b_1()
-            .border_color(theme.border)
             .child(
                 Icon::new(IconName::HardDrive)
                     .with_size(px(16.0))
@@ -1158,27 +1159,26 @@ impl AppView {
                     .gap_0()
                     .child(
                         div()
-                            .text_size(px(10.0))
-                            .text_color(theme.muted_foreground)
+                            .text_size(px(type_size::CAPTION))
+                            .text_color(palette.text_tertiary)
                             .child("扫描位置"),
                     )
-                    .child(div().text_size(px(12.5)).truncate().child(root)),
+                    .child(div().text_size(px(type_size::BODY)).truncate().child(root)),
             )
             .when(!compact, |this| {
                 this.child(
-                    Button::new("choose-directory")
+                    button("choose-directory", scanning || self.choosing, &theme)
                         .with_size(Size::Small)
                         .label("选择目录…")
                         .icon(IconName::FolderOpen)
                         .ghost()
-                        .disabled(scanning || self.choosing)
                         .on_click(cx.listener(|this, _, _, cx| this.choose_directory(cx))),
                 )
             })
             .child(action)
             .when(self.page != Page::Issues, |this| {
                 this.child(
-                    Button::new("toggle-inspector")
+                    button("toggle-inspector", false, &theme)
                         .with_size(Size::Small)
                         .icon(IconName::Info)
                         .ghost()
@@ -1199,6 +1199,7 @@ impl AppView {
 
     fn render_summary(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let total = if self.results.is_empty() {
             "0 B".to_string()
         } else if self.results.root_overflow() {
@@ -1226,8 +1227,8 @@ impl AppView {
                         .child(
                             h_flex()
                                 .justify_between()
-                                .text_size(px(10.0))
-                                .text_color(theme.muted_foreground)
+                                .text_size(px(type_size::CAPTION))
+                                .text_color(palette.text_tertiary)
                                 .child("所选卷")
                                 .child(format!(
                                     "可用 {} / {}",
@@ -1246,32 +1247,31 @@ impl AppView {
                                         .h_full()
                                         .w(relative(ratio.clamp(0.0, 1.0)))
                                         .rounded_full()
-                                        .bg(theme.muted_foreground.opacity(0.55)),
+                                        .bg(palette.meter),
                                 ),
                         )
                         .into_any_element()
                 }
                 Some(Err(error)) => div()
                     .w(px(228.0))
-                    .text_size(px(10.0))
-                    .text_color(theme.muted_foreground)
+                    .text_size(px(type_size::CAPTION))
+                    .text_color(palette.text_tertiary)
                     .child(format!("无法读取所选卷容量：{error}"))
                     .into_any_element(),
                 None => div()
                     .w(px(228.0))
-                    .text_size(px(10.0))
-                    .text_color(theme.muted_foreground)
+                    .text_size(px(type_size::CAPTION))
+                    .text_color(palette.text_tertiary)
                     .child("正在查询所选卷容量…")
                     .into_any_element(),
             })
         };
 
         v_flex()
+            .bg(palette.recessed)
             .px_4()
             .py_3()
             .gap_2()
-            .border_b_1()
-            .border_color(theme.border)
             .child(
                 h_flex()
                     .gap_5()
@@ -1282,8 +1282,8 @@ impl AppView {
                             .gap_1()
                             .child(
                                 div()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.muted_foreground)
+                                    .text_size(px(type_size::CAPTION))
+                                    .text_color(palette.text_tertiary)
                                     .child("已分配空间"),
                             )
                             .child(
@@ -1292,7 +1292,7 @@ impl AppView {
                                     .items_baseline()
                                     .child(
                                         div()
-                                            .text_size(px(24.0))
+                                            .text_size(px(type_size::METRIC))
                                             .font_semibold()
                                             .font_features(tabular_numbers())
                                             .child(total),
@@ -1317,7 +1317,7 @@ impl AppView {
                                             })
                                             .child(
                                                 div()
-                                                    .text_size(px(11.0))
+                                                    .text_size(px(type_size::LABEL))
                                                     .text_color(theme.muted_foreground)
                                                     .child(self.state_label()),
                                             ),
@@ -1350,8 +1350,8 @@ impl AppView {
             .children(self.capacity_notice().map(|notice| {
                 h_flex()
                     .gap_2()
-                    .text_size(px(10.5))
-                    .text_color(theme.muted_foreground)
+                    .text_size(px(type_size::CAPTION))
+                    .text_color(palette.text_tertiary)
                     .child(
                         Icon::new(IconName::TriangleAlert)
                             .with_size(px(12.0))
@@ -1362,7 +1362,7 @@ impl AppView {
             .children(self.notice.clone().map(|notice| {
                 h_flex()
                     .gap_2()
-                    .text_size(px(10.5))
+                    .text_size(px(type_size::CAPTION))
                     .text_color(theme.red)
                     .child(
                         Icon::new(IconName::CircleAlert)
@@ -1376,6 +1376,7 @@ impl AppView {
 
     fn render_breadcrumbs(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let mut ancestors = Vec::new();
         let mut ancestor = (self.directory < self.results.len()).then_some(self.directory);
         while let Some(id) = ancestor {
@@ -1390,7 +1391,7 @@ impl AppView {
                 crumbs.push(
                     Icon::new(IconName::ChevronRight)
                         .with_size(px(10.0))
-                        .text_color(theme.muted_foreground.opacity(0.7))
+                        .text_color(palette.text_tertiary)
                         .into_any_element(),
                 );
             }
@@ -1405,8 +1406,8 @@ impl AppView {
                     .id(ElementId::named_usize("crumb", id))
                     .px_1()
                     .py_1()
-                    .rounded(px(4.0))
-                    .text_size(px(12.0))
+                    .rounded(px(radius::SMALL))
+                    .text_size(px(type_size::BODY))
                     .text_color(if active {
                         theme.foreground
                     } else {
@@ -1436,19 +1437,18 @@ impl AppView {
 
     fn render_content_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         h_flex()
             .h(px(40.0))
+            .bg(palette.toolbar)
             .px_3()
             .gap_2()
-            .border_b_1()
-            .border_color(theme.border)
             .child(
-                Button::new("back")
+                button("back", self.history.is_empty(), &theme)
                     .with_size(Size::Small)
                     .icon(IconName::ChevronLeft)
                     .ghost()
                     .tooltip("返回 (⌫)")
-                    .disabled(self.history.is_empty())
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(id) = this.history.pop() {
                             this.navigate_to(id, false);
@@ -1459,32 +1459,35 @@ impl AppView {
             .child(self.render_breadcrumbs(cx))
             .child(
                 div()
-                    .text_size(px(10.0))
-                    .text_color(theme.muted_foreground)
+                    .text_size(px(type_size::CAPTION))
+                    .text_color(palette.text_tertiary)
                     .child("按大小 ↓"),
             )
             .child(
-                Button::new("reveal-toolbar")
-                    .with_size(Size::Small)
-                    .icon(IconName::FolderSearch)
-                    .ghost()
-                    .tooltip("在 Finder 中显示所选项目")
-                    .disabled(self.selected().is_none() || self.revealing)
-                    .on_click(cx.listener(|this, _, _, cx| this.reveal_selected(cx))),
+                button(
+                    "reveal-toolbar",
+                    self.selected().is_none() || self.revealing,
+                    &theme,
+                )
+                .with_size(Size::Small)
+                .icon(IconName::FolderSearch)
+                .ghost()
+                .tooltip("在 Finder 中显示所选项目")
+                .on_click(cx.listener(|this, _, _, cx| this.reveal_selected(cx))),
             )
             .into_any_element()
     }
 
     fn render_table_header(&self, wide: bool, show_children: bool, cx: &App) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         h_flex()
             .h(px(28.0))
+            .bg(palette.recessed)
             .px_3()
             .gap_3()
-            .border_b_1()
-            .border_color(theme.border)
-            .text_size(px(10.0))
-            .text_color(theme.muted_foreground)
+            .text_size(px(type_size::CAPTION))
+            .text_color(palette.text_tertiary)
             .child(div().flex_1().min_w_0().pl(px(25.0)).child("名称"))
             .when(wide && show_children, |this| {
                 this.child(div().w(px(88.0)).child("直接子项"))
@@ -1496,6 +1499,7 @@ impl AppView {
 
     fn render_row(&self, index: usize, wide: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let id = self.visible_id(index);
         let selected = self.selected() == Some(id);
         let kind = self.results.kind(id);
@@ -1505,8 +1509,8 @@ impl AppView {
         let share = self.share(id);
         let bar_color = match kind {
             EntryKind::Directory => theme.chart_2,
-            EntryKind::File => theme.muted_foreground.opacity(0.55),
-            _ => theme.muted_foreground.opacity(0.35),
+            EntryKind::File => palette.meter,
+            _ => palette.text_disabled,
         };
         let entity = cx.entity().downgrade();
         let path = self.results.to_path_buf(id);
@@ -1572,11 +1576,11 @@ impl AppView {
                     .flex_1()
                     .min_w_0()
                     .gap_0()
-                    .child(div().text_size(px(12.5)).truncate().child(name))
+                    .child(div().text_size(px(type_size::BODY)).truncate().child(name))
                     .child(
                         div()
-                            .text_size(px(10.0))
-                            .text_color(theme.muted_foreground)
+                            .text_size(px(type_size::CAPTION))
+                            .text_color(palette.text_tertiary)
                             .truncate()
                             .child(subtitle),
                     ),
@@ -1585,8 +1589,8 @@ impl AppView {
                 this.child(
                     div()
                         .w(px(88.0))
-                        .text_size(px(10.5))
-                        .text_color(theme.muted_foreground)
+                        .text_size(px(type_size::CAPTION))
+                        .text_color(palette.text_tertiary)
                         .font_features(tabular_numbers())
                         .child(self.child_count_label(id)),
                 )
@@ -1615,8 +1619,8 @@ impl AppView {
                         div()
                             .w(px(48.0))
                             .text_right()
-                            .text_size(px(10.5))
-                            .text_color(theme.muted_foreground)
+                            .text_size(px(type_size::CAPTION))
+                            .text_color(palette.text_tertiary)
                             .font_features(tabular_numbers())
                             .child(self.share_label(id)),
                     ),
@@ -1625,7 +1629,7 @@ impl AppView {
                 div()
                     .w(px(92.0))
                     .text_right()
-                    .text_size(px(12.0))
+                    .text_size(px(type_size::BODY))
                     .font_features(tabular_numbers())
                     .child(self.entry_size(id)),
             );
@@ -1742,7 +1746,7 @@ impl AppView {
             })
             .child(
                 div()
-                    .text_size(px(13.0))
+                    .text_size(px(type_size::HEADING))
                     .font_medium()
                     .child(title.to_string()),
             )
@@ -1750,7 +1754,7 @@ impl AppView {
                 div()
                     .max_w(px(420.0))
                     .text_center()
-                    .text_size(px(11.0))
+                    .text_size(px(type_size::LABEL))
                     .text_color(theme.muted_foreground)
                     .child(detail.to_string()),
             )
@@ -1852,6 +1856,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let count = self.visible_len();
         let content = if count == 0 {
             self.directory_empty_state(cx)
@@ -1898,16 +1903,21 @@ impl AppView {
                         .h(px(34.0))
                         .px_3()
                         .gap_2()
-                        .child(div().text_size(px(11.0)).font_medium().child("最大的文件"))
                         .child(
                             div()
-                                .text_size(px(10.0))
-                                .text_color(theme.muted_foreground)
+                                .text_size(px(type_size::LABEL))
+                                .font_medium()
+                                .child("最大的文件"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(type_size::CAPTION))
+                                .text_color(palette.text_tertiary)
                                 .child("≥ 100 MiB · 已去重的普通文件"),
                         )
                         .child(div().flex_1())
                         .child(
-                            Button::new("all-large-files")
+                            button("all-large-files", false, &theme)
                                 .with_size(Size::Small)
                                 .label("查看全部")
                                 .ghost()
@@ -1930,15 +1940,19 @@ impl AppView {
             .child(
                 h_flex()
                     .h(px(40.0))
+                    .bg(palette.toolbar)
                     .px_3()
                     .gap_3()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(div().text_size(px(11.0)).font_medium().child("空间去向"))
                     .child(
                         div()
-                            .text_size(px(10.0))
-                            .text_color(theme.muted_foreground)
+                            .text_size(px(type_size::LABEL))
+                            .font_medium()
+                            .child("空间去向"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(type_size::CAPTION))
+                            .text_color(palette.text_tertiary)
                             .child(format!(
                                 "{} 个顶层条目 · 按已分配空间排序",
                                 format_count(count)
@@ -1953,6 +1967,7 @@ impl AppView {
 
     fn render_compact_file_row(&self, id: NodeId, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let name = self.results.name(id).to_string_lossy().into_owned();
         let parent = self
             .results
@@ -1996,7 +2011,7 @@ impl AppView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(11.5))
+                    .text_size(px(type_size::LABEL))
                     .truncate()
                     .child(name),
             )
@@ -2004,8 +2019,8 @@ impl AppView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(10.0))
-                    .text_color(theme.muted_foreground)
+                    .text_size(px(type_size::CAPTION))
+                    .text_color(palette.text_tertiary)
                     .truncate()
                     .child(parent),
             )
@@ -2013,8 +2028,8 @@ impl AppView {
                 div()
                     .w(px(56.0))
                     .text_right()
-                    .text_size(px(10.0))
-                    .text_color(theme.muted_foreground)
+                    .text_size(px(type_size::CAPTION))
+                    .text_color(palette.text_tertiary)
                     .font_features(tabular_numbers())
                     .child(self.share_label(id)),
             )
@@ -2022,7 +2037,7 @@ impl AppView {
                 div()
                     .w(px(88.0))
                     .text_right()
-                    .text_size(px(11.5))
+                    .text_size(px(type_size::LABEL))
                     .font_features(tabular_numbers())
                     .child(self.entry_size(id)),
             )
@@ -2031,6 +2046,7 @@ impl AppView {
 
     fn render_large_files_body(&self, wide: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let content = if self.visible_len() == 0 {
             let scanning = self.results.state == ScanState::Scanning;
             self.render_empty_state(
@@ -2091,25 +2107,29 @@ impl AppView {
             .child(
                 h_flex()
                     .h(px(40.0))
+                    .bg(palette.toolbar)
                     .px_3()
                     .gap_2()
-                    .border_b_1()
-                    .border_color(theme.border)
                     .child(
                         v_flex()
                             .gap_0()
-                            .child(div().text_size(px(11.0)).font_medium().child("大文件"))
                             .child(
                                 div()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.muted_foreground)
+                                    .text_size(px(type_size::LABEL))
+                                    .font_medium()
+                                    .child("大文件"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(type_size::CAPTION))
+                                    .text_color(palette.text_tertiary)
                                     .child("整个扫描范围 · 普通文件 · 已去重"),
                             ),
                     )
                     .child(div().flex_1())
                     .children(thresholds.into_iter().map(|(minimum, label)| {
                         let selected = self.minimum_bytes == minimum;
-                        Button::new(("threshold", minimum as usize))
+                        button(("threshold", minimum as usize), false, &theme)
                             .with_size(Size::Small)
                             .label(label)
                             .when(selected, |button| button.secondary())
@@ -2127,6 +2147,7 @@ impl AppView {
 
     fn render_issues_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let issue_border = theme.border.opacity(0.55);
         let issue_icon = theme.yellow;
         let issue_muted = theme.muted_foreground;
@@ -2181,13 +2202,13 @@ impl AppView {
                                                 .gap_1()
                                                 .child(
                                                     div()
-                                                        .text_size(px(11.5))
+                                                        .text_size(px(type_size::LABEL))
                                                         .truncate()
                                                         .child(issue.path.display().to_string()),
                                                 )
                                                 .child(
                                                     div()
-                                                        .text_size(px(10.0))
+                                                        .text_size(px(type_size::CAPTION))
                                                         .text_color(issue_muted)
                                                         .line_clamp(2)
                                                         .child(issue.message.clone()),
@@ -2212,20 +2233,19 @@ impl AppView {
             .child(
                 h_flex()
                     .h(px(40.0))
+                    .bg(palette.toolbar)
                     .px_3()
                     .gap_2()
-                    .border_b_1()
-                    .border_color(theme.border)
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(type_size::LABEL))
                             .font_medium()
                             .child("读取失败与扫描问题"),
                     )
                     .child(
                         div()
-                            .text_size(px(10.0))
-                            .text_color(theme.muted_foreground)
+                            .text_size(px(type_size::CAPTION))
+                            .text_color(palette.text_tertiary)
                             .child(format_count(self.results.issues.len())),
                     ),
             )
@@ -2235,6 +2255,7 @@ impl AppView {
 
     fn render_inspector(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let selected = self.selected();
         let body = match selected {
             None => v_flex()
@@ -2247,20 +2268,26 @@ impl AppView {
                         .with_size(px(20.0))
                         .text_color(theme.muted_foreground),
                 )
-                .child(div().text_size(px(12.0)).child("选择一个条目查看详情"))
+                .child(
+                    div()
+                        .text_size(px(type_size::BODY))
+                        .child("选择一个条目查看详情"),
+                )
                 .child(
                     div()
                         .max_w(px(220.0))
                         .text_center()
-                        .text_size(px(10.0))
-                        .text_color(theme.muted_foreground)
+                        .text_size(px(type_size::CAPTION))
+                        .text_color(palette.text_tertiary)
                         .child("显示完整路径、大小占比、扫描状态与归属说明。"),
                 )
                 .child(
                     div()
                         .mt_2()
-                        .text_size(px(10.0))
-                        .text_color(theme.muted_foreground)
+                        .max_w(px(220.0))
+                        .text_center()
+                        .text_size(px(type_size::CAPTION))
+                        .text_color(palette.text_tertiary)
                         .child("Clean 只读取文件系统信息，不修改任何文件。"),
                 )
                 .into_any_element(),
@@ -2305,15 +2332,15 @@ impl AppView {
                                     .gap_0()
                                     .child(
                                         div()
-                                            .text_size(px(13.0))
+                                            .text_size(px(type_size::HEADING))
                                             .font_medium()
                                             .truncate()
                                             .child(name),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(10.0))
-                                            .text_color(theme.muted_foreground)
+                                            .text_size(px(type_size::CAPTION))
+                                            .text_color(palette.text_tertiary)
                                             .child(self.kind_label(id)),
                                     ),
                             ),
@@ -2324,15 +2351,15 @@ impl AppView {
                             .items_baseline()
                             .child(
                                 div()
-                                    .text_size(px(21.0))
+                                    .text_size(px(type_size::METRIC))
                                     .font_semibold()
                                     .font_features(tabular_numbers())
                                     .child(size),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.muted_foreground)
+                                    .text_size(px(type_size::CAPTION))
+                                    .text_color(palette.text_tertiary)
                                     .child(format!("{} {}", self.share_caption(), share)),
                             ),
                     )
@@ -2347,13 +2374,13 @@ impl AppView {
                             .gap_1()
                             .child(
                                 div()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.muted_foreground)
+                                    .text_size(px(type_size::CAPTION))
+                                    .text_color(palette.text_tertiary)
                                     .child("完整路径"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.5))
+                                    .text_size(px(type_size::CAPTION))
                                     .font_family(theme.mono_font_family.clone())
                                     .whitespace_normal()
                                     .line_clamp(4)
@@ -2363,10 +2390,10 @@ impl AppView {
                     .child(
                         div()
                             .p_2()
-                            .rounded(px(5.0))
+                            .rounded(px(radius::CONTROL))
                             .bg(theme.muted)
-                            .text_size(px(10.0))
-                            .text_color(theme.muted_foreground)
+                            .text_size(px(type_size::CAPTION))
+                            .text_color(palette.text_tertiary)
                             .whitespace_normal()
                             .child(self.explanation(id)),
                     )
@@ -2374,7 +2401,7 @@ impl AppView {
                         v_flex()
                             .gap_1()
                             .children(is_directory.then(|| {
-                                Button::new("enter-directory")
+                                button("enter-directory", false, &theme)
                                     .with_size(Size::Small)
                                     .w_full()
                                     .label("进入目录")
@@ -2385,7 +2412,7 @@ impl AppView {
                                     }))
                             }))
                             .children((self.page == Page::LargeFiles).then(|| {
-                                Button::new("go-parent")
+                                button("go-parent", false, &theme)
                                     .with_size(Size::Small)
                                     .w_full()
                                     .label("前往所在目录")
@@ -2397,7 +2424,7 @@ impl AppView {
                                     }))
                             }))
                             .child(
-                                Button::new("inspector-reveal")
+                                button("inspector-reveal", self.revealing, &theme)
                                     .with_size(Size::Small)
                                     .w_full()
                                     .label(if self.revealing {
@@ -2407,13 +2434,12 @@ impl AppView {
                                     })
                                     .icon(IconName::FolderSearch)
                                     .secondary()
-                                    .disabled(self.revealing)
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.reveal_selected(cx)),
                                     ),
                             )
                             .child(
-                                Button::new("inspector-copy")
+                                button("inspector-copy", false, &theme)
                                     .with_size(Size::Small)
                                     .w_full()
                                     .label("复制路径")
@@ -2430,9 +2456,7 @@ impl AppView {
             .w(px(INSPECTOR_WIDTH))
             .h_full()
             .flex_shrink_0()
-            .border_l_1()
-            .border_color(theme.border)
-            .bg(theme.background)
+            .bg(palette.toolbar)
             .child(
                 v_flex()
                     .flex_1()
@@ -2513,6 +2537,7 @@ impl AppView {
 
     fn render_onboarding(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let home = platform::home_directory();
         let downloads = home.as_ref().map(|home| home.join("Downloads"));
         let home_enabled = home.is_some() && !self.choosing;
@@ -2526,8 +2551,8 @@ impl AppView {
             .child(
                 div()
                     .size(px(48.0))
-                    .rounded(px(12.0))
-                    .bg(theme.muted)
+                    .rounded(px(radius::LARGE))
+                    .bg(theme.selection)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -2543,7 +2568,7 @@ impl AppView {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(18.0))
+                            .text_size(px(type_size::TITLE))
                             .font_semibold()
                             .child("分析磁盘空间去了哪里"),
                     )
@@ -2551,7 +2576,7 @@ impl AppView {
                         div()
                             .max_w(px(460.0))
                             .text_center()
-                            .text_size(px(12.0))
+                            .text_size(px(type_size::BODY))
                             .text_color(theme.muted_foreground)
                             .child(
                                 "选择一个位置，Clean 会按文件系统报告的已分配空间统计目录与文件。扫描期间即可浏览，随时可以停止。",
@@ -2563,11 +2588,10 @@ impl AppView {
                     .gap_2()
                     .when_some(home, |this, home| {
                         this.child(
-                            Button::new("onboard-home")
+                            button("onboard-home", !home_enabled, &theme)
                                 .label("扫描主目录")
                                 .icon(IconName::House)
                                 .primary()
-                                .disabled(!home_enabled)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.start_scan(home.clone(), cx)
                                 })),
@@ -2575,22 +2599,20 @@ impl AppView {
                     })
                     .when_some(downloads, |this, downloads| {
                         this.child(
-                            Button::new("onboard-downloads")
+                            button("onboard-downloads", !downloads_enabled, &theme)
                                 .label("下载")
                                 .icon(IconName::Download)
                                 .secondary()
-                                .disabled(!downloads_enabled)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.start_scan(downloads.clone(), cx)
                                 })),
                         )
                     })
                     .child(
-                        Button::new("onboard-choose")
+                        button("onboard-choose", self.choosing, &theme)
                             .label("选择目录…")
                             .icon(IconName::FolderOpen)
                             .ghost()
-                            .disabled(self.choosing)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.choose_directory(cx)
                             })),
@@ -2598,8 +2620,8 @@ impl AppView {
             )
             .child(
                 div()
-                    .text_size(px(10.0))
-                    .text_color(theme.muted_foreground)
+                    .text_size(px(type_size::CAPTION))
+                    .text_color(palette.text_tertiary)
                     .child("只读分析 · 不删除或修改任何文件"),
             )
             .into_any_element()
@@ -2607,6 +2629,7 @@ impl AppView {
 
     fn render_status_bar(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let palette = Palette::for_theme(&theme);
         let selected = self.selected();
         let left = if let Some(id) = selected {
             let path = self.results.to_path_buf(id);
@@ -2618,22 +2641,22 @@ impl AppView {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(10.0))
-                        .text_color(theme.muted_foreground)
+                        .text_size(px(type_size::CAPTION))
+                        .text_color(palette.text_tertiary)
                         .child(path.display().to_string()),
                 )
                 .child(
                     div()
-                        .text_size(px(10.0))
-                        .text_color(theme.muted_foreground)
+                        .text_size(px(type_size::CAPTION))
+                        .text_color(palette.text_tertiary)
                         .font_features(tabular_numbers())
                         .child(self.entry_size(id)),
                 )
                 .into_any_element()
         } else {
             div()
-                .text_size(px(10.0))
-                .text_color(theme.muted_foreground)
+                .text_size(px(type_size::CAPTION))
+                .text_color(palette.text_tertiary)
                 .child("已分配空间不等于可释放空间 · 选择条目查看完整路径")
                 .into_any_element()
         };
@@ -2642,16 +2665,14 @@ impl AppView {
             .h(px(26.0))
             .px_3()
             .gap_3()
-            .border_t_1()
-            .border_color(theme.border)
             .bg(theme.status_bar)
             .child(left)
             .child(div().flex_1())
             .when(!compact, |this| {
                 this.child(
                     div()
-                        .text_size(px(10.0))
-                        .text_color(theme.muted_foreground)
+                        .text_size(px(type_size::CAPTION))
+                        .text_color(palette.text_tertiary)
                         .child("↑↓ 选择 · Enter 进入 · ⌫ 返回 · ⌘C 复制 · ⌘I 详情"),
                 )
             })
@@ -2709,6 +2730,12 @@ impl Render for AppView {
             .flex()
             .bg(background)
             .text_color(foreground)
+            .font(Font {
+                fallbacks: Some(FontFallbacks::from_fonts(vec!["PingFang SC".into()])),
+                ..font(cx.theme().font_family.clone())
+            })
+            .font_weight(FontWeight::NORMAL)
+            .text_size(px(type_size::BODY))
             .child(sidebar)
             .child(main)
     }
@@ -2720,24 +2747,25 @@ fn section_label(text: &str, color: Hsla) -> AnyElement {
         .px_2()
         .flex()
         .items_center()
-        .text_size(px(9.5))
+        .text_size(px(type_size::CAPTION))
         .text_color(color)
         .child(text.to_string())
         .into_any_element()
 }
 
 fn metric(label: &str, value: String, theme: &Theme) -> AnyElement {
+    let palette = Palette::for_theme(theme);
     v_flex()
         .gap_1()
         .child(
             div()
-                .text_size(px(10.0))
-                .text_color(theme.muted_foreground)
+                .text_size(px(type_size::CAPTION))
+                .text_color(palette.text_tertiary)
                 .child(label.to_string()),
         )
         .child(
             div()
-                .text_size(px(12.0))
+                .text_size(px(type_size::BODY))
                 .font_medium()
                 .font_features(tabular_numbers())
                 .child(value),
@@ -2750,7 +2778,7 @@ fn detail_row(label: &str, value: String, theme: &Theme) -> AnyElement {
         .justify_between()
         .items_start()
         .gap_3()
-        .text_size(px(10.5))
+        .text_size(px(type_size::CAPTION))
         .child(
             div()
                 .flex_shrink_0()
