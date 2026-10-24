@@ -1,7 +1,7 @@
 //! One traversal worker, a bounded channel and batches of at most 128 events.
-//! Sizes are logical bytes per file path: hard links count once per directory
-//! entry. Symlinks and special files contribute zero bytes and are not followed.
+//! Allocated file bytes belong to the first observed (device, inode) path.
 use std::{
+    collections::{HashMap, hash_map::Entry},
     io,
     path::{Path, PathBuf},
     sync::{
@@ -118,10 +118,12 @@ fn scan(
         path: root.into(),
         parent: None,
         kind: EntryKind::Directory,
-        bytes: 0,
+        bytes: fs.root_metadata().allocated_bytes,
+        hard_link_to: None,
     }) {
         return;
     }
+    let mut allocated_files = HashMap::new();
     let mut next_id = 1;
     let mut directories = vec![(0, root.to_path_buf(), fs.root_metadata().identity)];
     let mut errors = false;
@@ -175,7 +177,22 @@ fn scan(
             match observed {
                 Ok((path, metadata)) => {
                     let kind = metadata.kind;
-                    let bytes = metadata.bytes;
+                    let hard_link_to = if kind == EntryKind::File {
+                        match allocated_files.entry(metadata.identity) {
+                            Entry::Occupied(entry) => Some(*entry.get()),
+                            Entry::Vacant(entry) => {
+                                entry.insert(next_id);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let bytes = if hard_link_to.is_some() {
+                        0
+                    } else {
+                        metadata.allocated_bytes
+                    };
                     if kind == EntryKind::Directory {
                         directories.push((next_id, path.clone(), metadata.identity));
                     }
@@ -185,6 +202,7 @@ fn scan(
                         parent: Some(parent),
                         kind,
                         bytes,
+                        hard_link_to,
                     }) {
                         return;
                     }

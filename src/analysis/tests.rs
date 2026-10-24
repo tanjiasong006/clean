@@ -3,6 +3,7 @@ use crate::models::{EntryKind, ScanEvent, ScanState};
 
 fn entry(results: &mut ScanResults, path: &str, kind: EntryKind, bytes: u64) {
     results.apply(ScanEvent::Entry {
+        hard_link_to: None,
         path: path.into(),
         parent: (!results.nodes.is_empty()).then_some(0),
         kind,
@@ -36,6 +37,7 @@ fn index_adds_nested_files_without_duplicates_and_keeps_partial_results() {
     entry(&mut results, "/root", EntryKind::Directory, 0);
     entry(&mut results, "/root/nested", EntryKind::Directory, 0);
     results.apply(ScanEvent::Entry {
+        hard_link_to: None,
         path: "/root/nested/file".into(),
         parent: Some(1),
         kind: EntryKind::File,
@@ -71,18 +73,21 @@ fn directory_index_tracks_aggregate_size_changes_and_navigation() {
     assert_eq!(index.sorted(), sorted_children(&results, 0));
     let changes = results.apply_batch([
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/z/large".into(),
             parent: Some(1),
             kind: EntryKind::File,
             bytes: 100,
         },
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/a/small".into(),
             parent: Some(2),
             kind: EntryKind::File,
             bytes: 20,
         },
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/top".into(),
             parent: Some(0),
             kind: EntryKind::File,
@@ -94,6 +99,7 @@ fn directory_index_tracks_aggregate_size_changes_and_navigation() {
     assert_eq!(index.sorted(), sorted_children(&results, 0));
     let changes = results.apply_batch([
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/a/new".into(),
             parent: Some(2),
             kind: EntryKind::File,
@@ -126,4 +132,28 @@ fn size_indexes_share_node_paths_instead_of_copying_their_contents() {
         &results.nodes[1].path,
         &directory.entries.first().unwrap().1
     ));
+}
+
+#[test]
+fn large_file_index_excludes_hard_link_aliases_but_keeps_zero_allocation_files() {
+    let mut results = ScanResults::default();
+    entry(&mut results, "/root", EntryKind::Directory, 512);
+    entry(&mut results, "/root/original", EntryKind::File, 4096);
+    entry(&mut results, "/root/sparse", EntryKind::File, 0);
+    let mut index = LargeFileIndex::default();
+    index.update(&results);
+    results.apply(ScanEvent::Entry {
+        path: "/root/alias".into(),
+        parent: Some(0),
+        kind: EntryKind::File,
+        bytes: 0,
+        hard_link_to: Some(1),
+    });
+    index.update(&results);
+    index.update(&results);
+    assert_eq!(index.matching(0), vec![1, 2]);
+    assert_eq!(index.matching(1), vec![1]);
+    assert_eq!(results.files, 3);
+    assert_eq!(results.hard_links, 1);
+    assert_eq!(results.nodes[0].bytes, 512 + 4096);
 }

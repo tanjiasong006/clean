@@ -136,17 +136,45 @@ fn metadata_from_stat(stat: Stat) -> io::Result<EntryMetadata> {
         FileType::Symlink => EntryKind::Symlink,
         _ => EntryKind::Other,
     };
-    let bytes = if kind == EntryKind::File {
-        u64::try_from(stat.st_size).map_err(|_| io::Error::other("文件逻辑大小为负值。"))?
+    let allocated_bytes = if matches!(kind, EntryKind::File | EntryKind::Directory) {
+        allocated_bytes(stat.st_blocks)?
     } else {
         0
     };
     Ok(EntryMetadata {
         kind,
-        bytes,
+        allocated_bytes,
         identity: FileIdentity {
             device: stat.st_dev as u64,
             inode: stat.st_ino,
         },
     })
+}
+
+fn allocated_bytes(blocks: i64) -> io::Result<u64> {
+    u64::try_from(blocks)
+        .map_err(|_| io::Error::other("已分配块数为负值。"))?
+        .checked_mul(512)
+        .ok_or_else(|| io::Error::other("已分配空间超出 u64 统计范围。"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allocated_bytes;
+
+    #[test]
+    fn allocation_uses_512_byte_units_and_64_bit_counts() {
+        assert_eq!(allocated_bytes(0).unwrap(), 0);
+        assert_eq!(allocated_bytes(1).unwrap(), 512);
+        assert_eq!(allocated_bytes(1_i64 << 33).unwrap(), 1_u64 << 42);
+    }
+
+    #[test]
+    fn invalid_or_overflowing_allocation_is_an_error() {
+        assert!(allocated_bytes(-1).is_err());
+        assert!(allocated_bytes(i64::MAX).is_err());
+        let largest = (u64::MAX / 512) as i64;
+        assert_eq!(allocated_bytes(largest).unwrap(), largest as u64 * 512);
+        assert!(allocated_bytes(largest + 1).is_err());
+    }
 }

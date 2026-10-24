@@ -42,7 +42,7 @@ pub struct LargeFileIndex {
 impl LargeFileIndex {
     pub fn update(&mut self, results: &ScanResults) {
         for (id, node) in results.nodes.iter().enumerate().skip(self.indexed_nodes) {
-            if node.kind == crate::models::EntryKind::File {
+            if node.kind == crate::models::EntryKind::File && node.hard_link_to.is_none() {
                 self.files.insert(size_key(results, id));
             }
         }

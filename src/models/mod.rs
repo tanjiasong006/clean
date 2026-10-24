@@ -39,6 +39,8 @@ pub struct Node {
     pub kind: EntryKind,
     pub bytes: u64,
     pub size_overflow: bool,
+    // A repeated inode contributes zero bytes and refers to its first observed path.
+    pub hard_link_to: Option<NodeId>,
     pub children: Vec<NodeId>,
     pub pending_directories: usize,
     pub errors: usize,
@@ -63,6 +65,7 @@ pub enum ScanEvent {
         parent: Option<NodeId>,
         kind: EntryKind,
         bytes: u64,
+        hard_link_to: Option<NodeId>,
     },
     DirectoryRead(NodeId),
     Issue {
@@ -80,6 +83,7 @@ pub struct ScanResults {
     pub files: usize,
     pub directories: usize,
     pub symlinks: usize,
+    pub hard_links: usize,
 }
 
 #[derive(Debug)]
@@ -124,9 +128,11 @@ impl ScanResults {
                     parent,
                     kind,
                     bytes,
+                    hard_link_to,
                 } => {
                     let id = self.nodes.len();
                     let pending = usize::from(kind == EntryKind::Directory);
+                    self.hard_links += usize::from(hard_link_to.is_some());
                     match kind {
                         EntryKind::File => self.files += 1,
                         EntryKind::Directory => self.directories += 1,
@@ -139,6 +145,7 @@ impl ScanResults {
                         kind,
                         bytes,
                         size_overflow: false,
+                        hard_link_to,
                         children: Vec::new(),
                         pending_directories: pending,
                         errors: 0,
@@ -187,7 +194,7 @@ impl ScanResults {
                 self.issues.push(ScanIssue {
                     path: root.path.as_ref().clone(),
                     message:
-                        "逻辑大小总量超出 u64 统计范围，已停止将溢出目录的大小与占比视为精确值。"
+                        "已分配空间总量超出 u64 统计范围，已停止将溢出目录的大小与占比视为精确值。"
                             .into(),
                 });
             }

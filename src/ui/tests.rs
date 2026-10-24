@@ -16,6 +16,7 @@ fn populated_view() -> AppView {
         ("/root/small", Some(0), EntryKind::File, 10),
     ] {
         view.results.apply(ScanEvent::Entry {
+            hard_link_to: None,
             path: path.into(),
             parent,
             kind,
@@ -101,6 +102,7 @@ fn discoveries_while_issues_are_visible_are_indexed_when_returning_to_large_file
     let mut view = populated_view();
     view.set_page(Page::Issues);
     view.results.apply(ScanEvent::Entry {
+        hard_link_to: None,
         path: "/root/new".into(),
         parent: Some(0),
         kind: EntryKind::File,
@@ -119,12 +121,14 @@ fn batched_updates_keep_cached_directory_sorting_current_while_hidden() {
     view.set_page(Page::Issues);
     view.apply_updates([
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/new".into(),
             parent: Some(0),
             kind: EntryKind::File,
             bytes: 3 * 1024 * 1024 * 1024,
         },
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/nested/new".into(),
             parent: Some(1),
             kind: EntryKind::File,
@@ -143,6 +147,7 @@ fn throttled_results_refresh_without_waiting_for_another_worker_event() {
     view.results.state = crate::models::ScanState::Scanning;
     view.last_refresh = std::time::Instant::now();
     view.apply_updates([ScanEvent::Entry {
+        hard_link_to: None,
         path: "/root/new".into(),
         parent: Some(0),
         kind: EntryKind::File,
@@ -164,6 +169,7 @@ fn finishing_flushes_throttled_visible_results_immediately() {
     view.last_refresh = std::time::Instant::now();
     view.apply_updates([
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/new".into(),
             parent: Some(0),
             kind: EntryKind::File,
@@ -176,7 +182,7 @@ fn finishing_flushes_throttled_visible_results_immediately() {
 }
 
 #[test]
-fn capacity_notice_compares_logical_total_to_capacity_not_available_space() {
+fn capacity_notice_compares_allocated_total_to_capacity_not_available_space() {
     let mut view = populated_view();
     let bytes = view.results.nodes[0].bytes;
     view.disk_space = Some(Ok(crate::models::DiskSpace {
@@ -198,7 +204,7 @@ fn capacity_notice_compares_logical_total_to_capacity_not_available_space() {
 }
 
 #[test]
-fn capacity_notice_needs_a_known_capacity_and_an_exact_logical_total() {
+fn capacity_notice_needs_a_known_capacity_and_an_exact_allocated_total() {
     let mut view = populated_view();
     assert!(view.capacity_notice().is_none());
     view.disk_space = Some(Err("volume query failed".into()));
@@ -211,4 +217,29 @@ fn capacity_notice_needs_a_known_capacity_and_an_exact_logical_total() {
     assert!(view.capacity_notice().is_none());
     view.results.nodes.clear();
     assert!(view.capacity_notice().is_none());
+}
+
+#[test]
+fn hard_link_aliases_show_their_owner_instead_of_misleading_zero_bytes() {
+    let mut view = populated_view();
+    let before = view.results.nodes[0].bytes;
+    view.apply_updates([ScanEvent::Entry {
+        path: "/root/nested/alias".into(),
+        parent: Some(1),
+        kind: EntryKind::File,
+        bytes: 0,
+        hard_link_to: Some(2),
+    }]);
+    assert_eq!(view.results.nodes[0].bytes, before);
+    assert_eq!(view.results.files, 4);
+    assert_eq!(view.results.hard_links, 1);
+    assert_eq!(view.entry_size(5), "已去重");
+    assert_eq!(view.entry_description(5), "硬链接 · 已计入 /root/top");
+    view.navigate_to(1, false);
+    assert_eq!(view.visible, vec![3, 5]);
+    view.views.entry(1).or_default().selected = Some(5);
+    assert_eq!(view.selected(), Some(5));
+    view.set_minimum(0);
+    view.set_page(Page::LargeFiles);
+    assert_eq!(view.visible, vec![3, 2, 4]);
 }

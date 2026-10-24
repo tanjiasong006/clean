@@ -9,7 +9,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::RootFileSystem;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
     pub device: u64,
     pub inode: u64,
@@ -18,7 +18,7 @@ pub struct FileIdentity {
 #[derive(Clone, Copy, Debug)]
 pub struct EntryMetadata {
     pub kind: EntryKind,
-    pub bytes: u64,
+    pub allocated_bytes: u64,
     pub identity: FileIdentity,
 }
 

@@ -171,7 +171,7 @@ impl AppView {
         let root = self.results.nodes.first()?;
         let space = self.disk_space.as_ref()?.as_ref().ok()?;
         (!root.size_overflow && root.bytes > space.capacity).then_some(
-            "逻辑总量已超过所选卷容量，但不代表实际磁盘占用。稀疏文件、硬链接或跨卷扫描等均可能造成差异。",
+            "已分配空间总量超过所选卷容量；APFS 共享数据或跨卷扫描可能造成差异，此数值不代表可释放空间。",
         )
     }
 
@@ -359,6 +359,41 @@ impl AppView {
         cx.notify();
     }
 
+    fn entry_description(&self, id: NodeId) -> String {
+        let node = &self.results.nodes[id];
+        if let Some(owner) = node.hard_link_to {
+            return format!(
+                "硬链接 · 已计入 {}",
+                self.results.nodes[owner].path.display()
+            );
+        }
+        if self.page == Page::LargeFiles {
+            return node.path.display().to_string();
+        }
+        let status = match node.kind {
+            EntryKind::Symlink => "符号链接 · 已跳过",
+            EntryKind::Other => "特殊文件 · 已跳过",
+            EntryKind::Directory if node.size_overflow => "已分配空间超出统计范围",
+            EntryKind::Directory if node.errors > 0 => "含读取失败项",
+            EntryKind::Directory if !node.is_complete() => "尚未扫描完整",
+            EntryKind::Directory if node.children.is_empty() => "空目录",
+            EntryKind::Directory => "目录 · 双击进入",
+            EntryKind::File => "文件",
+        };
+        status.to_string()
+    }
+
+    fn entry_size(&self, id: NodeId) -> String {
+        let node = &self.results.nodes[id];
+        if node.hard_link_to.is_some() {
+            "已去重".into()
+        } else if node.size_overflow {
+            "超出范围".into()
+        } else {
+            format_bytes(node.bytes)
+        }
+    }
+
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let id = self.visible[index];
         let node = &self.results.nodes[id];
@@ -377,21 +412,7 @@ impl AppView {
             .unwrap_or(node.path.as_os_str())
             .to_string_lossy()
             .into_owned();
-        let status = match node.kind {
-            EntryKind::Symlink => "符号链接 · 已跳过",
-            EntryKind::Other => "特殊文件 · 已跳过",
-            EntryKind::Directory if node.size_overflow => "逻辑大小超出统计范围",
-            EntryKind::Directory if node.errors > 0 => "含读取失败项",
-            EntryKind::Directory if !node.is_complete() => "尚未扫描完整",
-            EntryKind::Directory if node.children.is_empty() => "空目录",
-            EntryKind::Directory => "目录 · 双击进入",
-            EntryKind::File => "文件",
-        };
-        let description = if large_file {
-            node.path.display().to_string()
-        } else {
-            status.to_string()
-        };
+        let description = self.entry_description(id);
         let denominator = &self.results.nodes[if large_file { 0 } else { self.directory }];
         let total = denominator.bytes;
         let ratio = if total == 0 {
@@ -463,16 +484,7 @@ impl AppView {
                     )
                     .into_any_element()
             })
-            .child(
-                div()
-                    .w(px(100.0))
-                    .text_right()
-                    .child(if node.size_overflow {
-                        "超出范围".into()
-                    } else {
-                        format_bytes(node.bytes)
-                    }),
-            )
+            .child(div().w(px(100.0)).text_right().child(self.entry_size(id)))
             .into_any_element()
     }
 }
@@ -487,8 +499,8 @@ impl Render for AppView {
             .scan_root
             .as_ref()
             .map(|path| path.display().to_string());
-        let logical_size = match self.results.nodes.first() {
-            Some(node) if node.size_overflow => "逻辑大小超出统计范围".into(),
+        let allocated_size = match self.results.nodes.first() {
+            Some(node) if node.size_overflow => "已分配空间超出统计范围".into(),
             Some(node) => format_bytes(node.bytes),
             None => format_bytes(0),
         };
@@ -700,11 +712,11 @@ impl Render for AppView {
                 .child(div().text_lg().child(self.results.state.label())).child(cancel))
             .child(div().text_sm().truncate().text_color(cx.theme().muted_foreground)
                 .child(root_path.unwrap_or_else(|| "尚未选择扫描位置".into())))
-            .child(div().text_2xl().child(format!("逻辑总量 {} · {} 个文件 · {} 个目录",
-                logical_size, self.results.files, self.results.directories)))
+            .child(div().text_2xl().child(format!("已分配空间 {} · {} 个文件路径 · {} 个目录",
+                allocated_size, self.results.files, self.results.directories)))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!(
-                "文件逻辑大小累加，非磁盘实际占用 · 硬链接按路径重复计数 · 跳过 {} 个符号链接 · 非可释放空间",
-                self.results.symlinks)))
+                "硬链接仅计入首次发现路径（去重 {} 条） · 跳过 {} 个符号链接 · 非独占或可释放空间",
+                self.results.hard_links, self.results.symlinks)))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(disk_label))
             .children(self.capacity_notice().map(|notice| div().text_sm().child(notice)))
             .children(self.notice.clone().map(|notice| div().text_sm().child(notice)));
@@ -756,7 +768,7 @@ impl Render for AppView {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(div().text_sm().child("最小逻辑大小"))
+                .child(div().text_sm().child("最小已分配空间"))
                 .children(
                     [
                         (0, "全部文件"),
@@ -798,9 +810,9 @@ impl Render for AppView {
             .child(if self.page == Page::Issues {
                 ""
             } else if self.page == Page::LargeFiles {
-                "占扫描总量 / 逻辑大小 ↓"
+                "占扫描总量 / 已分配空间 ↓"
             } else {
-                "占当前目录 / 逻辑大小 ↓"
+                "占当前目录 / 已分配空间 ↓"
             });
         let footer = div()
             .px_4()

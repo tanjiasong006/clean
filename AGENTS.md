@@ -31,7 +31,7 @@ Defer deletion, automated cleanup, duplicate detection, application uninstall, s
 - Preserve partial results after cancellation and label incomplete scans clearly.
 - Report inaccessible or failed directories separately; never represent them as empty.
 - Do not follow symbolic links by default.
-- Display logical file size initially. Define hard-link counting explicitly and test it before treating totals as authoritative.
-- Show disk capacity/free space separately; do not equate scan totals with reclaimable space. Physical allocation and shared-data accounting require separate design.
+- Display only filesystem-reported allocated space (on macOS, `st_blocks × 512`), including directory allocation. Deduplicate regular files by device and inode within each scan: attribute bytes to the first observed path, retain other paths with an explicit already-counted marker, and exclude those aliases from the large-file index. Do not claim APFS shared blocks are exclusive or reclaimable space.
+- Show disk capacity/free space separately; do not equate scan totals with reclaimable space. Shared-data ownership and reclaimable-space estimates require separate design.
 
 Validate scanning with temporary-directory tests covering symlinks, hard links, cancellation, read failures, and files changing during scans. Represent idle, scanning, partial, complete, and failed states explicitly in the UI.

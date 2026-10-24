@@ -18,6 +18,7 @@ fn measure(depth: usize, indexes: bool) {
     const BATCH: usize = 1024;
     let mut results = ScanResults::default();
     results.apply_batch((0..=depth).map(|id| ScanEvent::Entry {
+        hard_link_to: None,
         path: format!("/root/dir-{id}").into(),
         parent: id.checked_sub(1),
         kind: EntryKind::Directory,
@@ -31,6 +32,7 @@ fn measure(depth: usize, indexes: bool) {
         let changes =
             results.apply_batch(
                 (first..(first + BATCH).min(FILES)).map(|n| ScanEvent::Entry {
+                    hard_link_to: None,
                     path: format!("/root/file-{n:06}").into(),
                     parent: Some(depth),
                     kind: EntryKind::File,

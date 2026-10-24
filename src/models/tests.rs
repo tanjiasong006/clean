@@ -90,6 +90,7 @@ impl Reference {
 
 fn sample_events() -> Vec<ScanEvent> {
     let mut events = vec![ScanEvent::Entry {
+        hard_link_to: None,
         path: "/root".into(),
         parent: None,
         kind: EntryKind::Directory,
@@ -107,6 +108,7 @@ fn sample_events() -> Vec<ScanEvent> {
             _ => EntryKind::File,
         };
         events.push(ScanEvent::Entry {
+            hard_link_to: None,
             path: format!("/entry-{id}").into(),
             parent: Some(parent),
             kind,
@@ -167,12 +169,14 @@ fn changes_contain_each_affected_node_once_with_its_previous_size() {
     let mut results = ScanResults::default();
     results.apply_batch([
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root".into(),
             parent: None,
             kind: EntryKind::Directory,
             bytes: 0,
         },
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/nested".into(),
             parent: Some(0),
             kind: EntryKind::Directory,
@@ -180,6 +184,7 @@ fn changes_contain_each_affected_node_once_with_its_previous_size() {
         },
     ]);
     let changes = results.apply_batch((0..1024).map(|id| ScanEvent::Entry {
+        hard_link_to: None,
         path: format!("/root/nested/{id}").into(),
         parent: Some(1),
         kind: EntryKind::File,
@@ -211,18 +216,21 @@ fn unfinished_subtrees_and_read_failures_stay_incomplete_in_the_same_batch() {
     let mut results = ScanResults::default();
     results.apply_batch([
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root".into(),
             parent: None,
             kind: EntryKind::Directory,
             bytes: 0,
         },
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/unread".into(),
             parent: Some(0),
             kind: EntryKind::Directory,
             bytes: 0,
         },
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/denied".into(),
             parent: Some(0),
             kind: EntryKind::Directory,
@@ -251,18 +259,21 @@ fn size_overflow_saturates_without_wrapping_or_panicking() {
     let mut results = ScanResults::default();
     results.apply_batch([
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root".into(),
             parent: None,
             kind: EntryKind::Directory,
             bytes: 0,
         },
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/large".into(),
             parent: Some(0),
             kind: EntryKind::File,
             bytes: u64::MAX,
         },
         ScanEvent::Entry {
+            hard_link_to: None,
             path: "/root/one".into(),
             parent: Some(0),
             kind: EntryKind::File,
@@ -280,30 +291,35 @@ fn overflow_is_reported_once_and_cannot_be_finished_as_an_exact_complete_scan() 
         let mut results = ScanResults::default();
         let mut events = vec![
             ScanEvent::Entry {
+                hard_link_to: None,
                 path: "/root".into(),
                 parent: None,
                 kind: EntryKind::Directory,
                 bytes: 0,
             },
             ScanEvent::Entry {
+                hard_link_to: None,
                 path: "/root/dir".into(),
                 parent: Some(0),
                 kind: EntryKind::Directory,
                 bytes: 0,
             },
             ScanEvent::Entry {
+                hard_link_to: None,
                 path: "/root/dir/a".into(),
                 parent: Some(1),
                 kind: EntryKind::File,
                 bytes: u64::MAX,
             },
             ScanEvent::Entry {
+                hard_link_to: None,
                 path: "/root/dir/b".into(),
                 parent: Some(1),
                 kind: EntryKind::File,
                 bytes: 1,
             },
             ScanEvent::Entry {
+                hard_link_to: None,
                 path: "/root/dir/c".into(),
                 parent: Some(1),
                 kind: EntryKind::File,
@@ -328,5 +344,62 @@ fn overflow_is_reported_once_and_cannot_be_finished_as_an_exact_complete_scan() 
             assert!(!node.is_complete());
         }
         assert!(!results.nodes[2].size_overflow);
+    }
+}
+
+#[test]
+fn directory_allocation_and_hard_link_ownership_survive_batch_boundaries() {
+    for batch_size in [1, 2, 3, 128] {
+        let mut results = ScanResults::default();
+        let mut events = vec![
+            ScanEvent::Entry {
+                path: "/root".into(),
+                parent: None,
+                kind: EntryKind::Directory,
+                bytes: 512,
+                hard_link_to: None,
+            },
+            ScanEvent::Entry {
+                path: "/root/file".into(),
+                parent: Some(0),
+                kind: EntryKind::File,
+                bytes: 4096,
+                hard_link_to: None,
+            },
+            ScanEvent::Entry {
+                path: "/root/nested".into(),
+                parent: Some(0),
+                kind: EntryKind::Directory,
+                bytes: 1024,
+                hard_link_to: None,
+            },
+            ScanEvent::Entry {
+                path: "/root/nested/alias".into(),
+                parent: Some(2),
+                kind: EntryKind::File,
+                bytes: 0,
+                hard_link_to: Some(1),
+            },
+            ScanEvent::DirectoryRead(0),
+            ScanEvent::DirectoryRead(2),
+            ScanEvent::Finished(ScanState::Complete),
+        ]
+        .into_iter();
+        loop {
+            let batch: Vec<_> = events.by_ref().take(batch_size).collect();
+            if batch.is_empty() {
+                break;
+            }
+            results.apply_batch(batch);
+        }
+        assert_eq!(results.state, ScanState::Complete);
+        assert_eq!(results.nodes[0].bytes, 512 + 4096 + 1024);
+        assert_eq!(results.nodes[2].bytes, 1024);
+        assert_eq!(results.nodes[3].bytes, 0);
+        assert_eq!(results.nodes[3].hard_link_to, Some(1));
+        assert_eq!(results.files, 2);
+        assert_eq!(results.hard_links, 1);
+        assert!(results.nodes.iter().all(|node| node.is_complete()));
+        assert!(results.issues.is_empty());
     }
 }

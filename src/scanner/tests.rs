@@ -1,6 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs,
+    os::unix::fs::MetadataExt,
     rc::Rc,
     sync::atomic::AtomicUsize,
 };
@@ -72,8 +73,34 @@ fn node<'a>(results: &'a ScanResults, path: &Path) -> &'a crate::models::Node {
         .unwrap()
 }
 
+fn allocated(path: &Path) -> u64 {
+    fs::symlink_metadata(path)
+        .unwrap()
+        .blocks()
+        .checked_mul(512)
+        .unwrap()
+}
+
+fn assert_allocated_totals(results: &ScanResults) {
+    for node in &results.nodes {
+        let own = if matches!(node.kind, EntryKind::File | EntryKind::Directory)
+            && node.hard_link_to.is_none()
+        {
+            allocated(&node.path)
+        } else {
+            0
+        };
+        let children: u64 = node
+            .children
+            .iter()
+            .map(|id| results.nodes[*id].bytes)
+            .sum();
+        assert_eq!(node.bytes, own + children, "{}", node.path.display());
+    }
+}
+
 #[test]
-fn aggregates_nested_directories_and_sorts_by_logical_size() {
+fn aggregates_nested_directories_and_sorts_by_allocated_space() {
     let temp = TempDirectory::new();
     temp.file("small", 8);
     temp.file("nested/a", 40);
@@ -83,9 +110,7 @@ fn aggregates_nested_directories_and_sorts_by_logical_size() {
     assert_eq!(results.state, ScanState::Complete);
     assert_eq!(results.files, 3);
     assert_eq!(results.directories, 4); // Includes the selected root.
-    assert_eq!(results.nodes[0].bytes, 108);
-    assert_eq!(node(&results, &temp.0.join("nested")).bytes, 100);
-    assert_eq!(node(&results, &temp.0.join("nested/deep")).bytes, 60);
+    assert_allocated_totals(&results);
     assert!(results.nodes.iter().all(|node| node.is_complete()));
     let children = sorted_children(&results, 0);
     assert_eq!(
@@ -117,7 +142,10 @@ fn skips_directory_file_dangling_and_cyclic_symlinks() {
     symlink(temp.0.join("missing"), temp.0.join("dangling")).unwrap();
     let results = collect_real(&temp.0);
     assert_eq!(results.state, ScanState::Complete);
-    assert_eq!(results.nodes[0].bytes, 12);
+    assert_allocated_totals(&results);
+    for link in ["external", "cycle", "link", "dangling"] {
+        assert_eq!(node(&results, &temp.0.join(link)).bytes, 0);
+    }
     assert_eq!(results.files, 1);
     assert_eq!(results.directories, 1);
     assert_eq!(results.symlinks, 4);
@@ -129,7 +157,7 @@ fn skips_directory_file_dangling_and_cyclic_symlinks() {
 }
 
 #[test]
-fn hard_links_are_counted_once_per_path_even_across_directories() {
+fn hard_links_are_counted_once_across_directories_and_keep_all_paths() {
     let temp = TempDirectory::new();
     let original = temp.file("original", 37);
     fs::create_dir(temp.0.join("nested")).unwrap();
@@ -138,8 +166,36 @@ fn hard_links_are_counted_once_per_path_even_across_directories() {
     let results = collect_real(&temp.0);
     assert_eq!(results.state, ScanState::Complete);
     assert_eq!(results.files, 3);
-    assert_eq!(results.nodes[0].bytes, 111);
-    assert_eq!(node(&results, &temp.0.join("nested")).bytes, 37);
+    assert_eq!(results.hard_links, 2);
+    let owners: Vec<_> = results
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == EntryKind::File && node.hard_link_to.is_none())
+        .collect();
+    assert_eq!(owners.len(), 1);
+    let (owner_id, owner) = owners[0];
+    assert_eq!(owner.bytes, allocated(&original));
+    for (id, link) in results
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.hard_link_to.is_some())
+    {
+        assert_eq!(link.hard_link_to, Some(owner_id));
+        assert!(owner_id < id);
+        assert_eq!(link.bytes, 0);
+    }
+    assert_allocated_totals(&results);
+    let nested = node(&results, &temp.0.join("nested"));
+    assert_eq!(nested.bytes, allocated(&temp.0.join("nested")));
+    let rescanned = collect_real(&temp.0);
+    assert_eq!(rescanned.nodes[0].bytes, results.nodes[0].bytes);
+    assert_eq!(rescanned.hard_links, 2);
+    let separately = collect_real(&temp.0.join("nested"));
+    assert_eq!(separately.files, 1);
+    assert_eq!(separately.hard_links, 0);
+    assert_allocated_totals(&separately);
 }
 
 #[test]
@@ -167,16 +223,19 @@ fn cancellation_keeps_partial_results_and_unread_directories_incomplete() {
     );
     assert_eq!(results.state, ScanState::Partial);
     assert_eq!(results.files, 1);
-    assert_eq!(results.nodes[0].bytes, 10);
+    assert_allocated_totals(&results);
     assert!(!results.nodes[0].is_complete());
     assert!(!node(&results, &temp.0.join("nested")).is_complete());
     assert!(results.issues.is_empty());
 }
 
 type Hook = Rc<dyn Fn(&Path) -> io::Result<()>>;
+type MetadataHook = Rc<dyn Fn(&Path, EntryMetadata) -> EntryMetadata>;
 
 struct TestFileSystem {
     real: RootFileSystem,
+    root: PathBuf,
+    metadata_override: MetadataHook,
     before_read: Hook,
     before_metadata: Hook,
     before_next: Hook,
@@ -187,6 +246,8 @@ impl TestFileSystem {
     fn new(root: &Path) -> Self {
         Self {
             real: RootFileSystem::open(root).unwrap(),
+            root: root.into(),
+            metadata_override: Rc::new(|_, metadata| metadata),
             before_read: Rc::new(|_| Ok(())),
             before_metadata: Rc::new(|_| Ok(())),
             before_next: Rc::new(|_| Ok(())),
@@ -197,7 +258,7 @@ impl TestFileSystem {
 
 impl FileSystem for TestFileSystem {
     fn root_metadata(&self) -> EntryMetadata {
-        self.real.root_metadata()
+        (self.metadata_override)(&self.root, self.real.root_metadata())
     }
 
     fn read_dir(
@@ -210,6 +271,7 @@ impl FileSystem for TestFileSystem {
             inner: self.real.read_dir(path, expected)?,
             path: path.into(),
             before_metadata: self.before_metadata.clone(),
+            metadata_override: self.metadata_override.clone(),
             before_next: self.before_next.clone(),
             broken_listing: self.broken_listing,
         }))
@@ -218,6 +280,7 @@ impl FileSystem for TestFileSystem {
 
 struct TestReader {
     inner: Box<dyn DirectoryReader>,
+    metadata_override: MetadataHook,
     path: PathBuf,
     before_metadata: Hook,
     before_next: Hook,
@@ -241,7 +304,9 @@ impl Iterator for TestReader {
 impl DirectoryReader for TestReader {
     fn metadata(&self, name: &OsStr) -> io::Result<EntryMetadata> {
         (self.before_metadata)(&self.path.join(name))?;
-        self.inner.metadata(name)
+        self.inner
+            .metadata(name)
+            .map(|metadata| (self.metadata_override)(&self.path.join(name), metadata))
     }
 }
 
@@ -266,7 +331,7 @@ fn unreadable_directory_is_reported_separately_and_is_never_empty() {
     let blocked = temp.0.join("blocked");
     let results = collect(&temp.0, &denied(&temp.0, blocked.clone()));
     assert_eq!(results.state, ScanState::Partial);
-    assert_eq!(results.nodes[0].bytes, 25);
+    assert_allocated_totals(&results);
     assert_eq!(results.issues.len(), 1);
     assert_eq!(results.issues[0].path, blocked);
     assert!(!node(&results, &blocked).is_complete());
@@ -298,7 +363,7 @@ fn changing_file(root: &Path, target: PathBuf, remove: bool) -> TestFileSystem {
                 if remove {
                     fs::remove_file(path)?;
                 } else {
-                    fs::write(path, [0; 80])?;
+                    fs::write(path, [0; 80 * 1024])?;
                 }
             }
             Ok(())
@@ -314,19 +379,22 @@ fn a_file_removed_during_scan_is_an_issue_not_an_empty_success() {
     let results = collect(&temp.0, &changing_file(&temp.0, path.clone(), true));
     assert_eq!(results.state, ScanState::Partial);
     assert_eq!(results.files, 0);
-    assert_eq!(results.nodes[0].bytes, 0);
+    assert_eq!(results.nodes[0].bytes, allocated(&temp.0));
     assert_eq!(results.issues.len(), 1);
     assert_eq!(results.issues[0].path, path);
     assert!(!results.nodes[0].is_complete());
 }
 
 #[test]
-fn file_size_is_the_logical_size_observed_at_metadata_read_time() {
+fn file_allocation_is_observed_at_metadata_read_time() {
     let temp = TempDirectory::new();
     let path = temp.file("grows", 10);
-    let results = collect(&temp.0, &changing_file(&temp.0, path, false));
+    let before = allocated(&path);
+    let results = collect(&temp.0, &changing_file(&temp.0, path.clone(), false));
     assert_eq!(results.state, ScanState::Complete);
-    assert_eq!(results.nodes[0].bytes, 80);
+    assert!(node(&results, &path).bytes > before);
+    assert_eq!(fs::metadata(&path).unwrap().len(), 80 * 1024);
+    assert_allocated_totals(&results);
     assert_eq!(results.files, 1);
 }
 
@@ -343,7 +411,7 @@ fn directory_iterator_failures_keep_previously_discovered_files() {
     );
     assert_eq!(results.state, ScanState::Partial);
     assert_eq!(results.files, 1);
-    assert_eq!(results.nodes[0].bytes, 30);
+    assert_allocated_totals(&results);
     assert_eq!(results.issues.len(), 1);
     assert!(!results.nodes[0].is_complete());
 }
@@ -374,7 +442,7 @@ fn worker_delivers_bounded_batches_and_flushes_on_cancellation() {
     }
     assert_eq!(results.state, ScanState::Partial);
     assert!(results.files > 0 && results.files < 1600);
-    assert_eq!(results.nodes[0].bytes, results.files as u64);
+    assert_allocated_totals(&results);
     assert!(!results.nodes[0].is_complete());
 }
 
@@ -388,6 +456,9 @@ fn queued_directory_replacements_are_incomplete_and_never_read() {
         temp.file("known", 17);
         temp.file("queued/original", 40);
         external.file("outside", 999);
+        let expected = allocated(&temp.0)
+            + allocated(&temp.0.join("known"))
+            + allocated(&temp.0.join("queued"));
         let target = temp.0.join("queued");
         let moved = backup.0.join("original");
         let outside = external.0.clone();
@@ -409,7 +480,7 @@ fn queued_directory_replacements_are_incomplete_and_never_read() {
         let results = collect(&temp.0, &fs);
         assert_eq!(results.state, ScanState::Partial);
         assert_eq!(results.files, 1);
-        assert_eq!(results.nodes[0].bytes, 17);
+        assert_eq!(results.nodes[0].bytes, expected);
         assert_eq!(results.issues.len(), 1);
         assert!(!node(&results, &temp.0.join("queued")).is_complete());
         assert!(node(&results, &temp.0.join("queued")).children.is_empty());
@@ -424,6 +495,9 @@ fn replacing_a_queued_ancestor_with_a_symlink_cannot_escape_the_root() {
     let backup = TempDirectory::new();
     temp.file("outer/inner/original", 20);
     external.file("inner/outside", 999);
+    let expected = allocated(&temp.0)
+        + allocated(&temp.0.join("outer"))
+        + allocated(&temp.0.join("outer/inner"));
     let outer = temp.0.join("outer");
     let inner = outer.join("inner");
     let moved = backup.0.join("original");
@@ -441,7 +515,7 @@ fn replacing_a_queued_ancestor_with_a_symlink_cannot_escape_the_root() {
     let results = collect(&temp.0, &fs);
     assert_eq!(results.state, ScanState::Partial);
     assert_eq!(results.files, 0);
-    assert_eq!(results.nodes[0].bytes, 0);
+    assert_eq!(results.nodes[0].bytes, expected);
     assert_eq!(results.issues.len(), 1);
     assert!(!node(&results, &temp.0.join("outer/inner")).is_complete());
 }
@@ -453,6 +527,7 @@ fn metadata_stays_relative_to_the_open_directory_after_path_replacement() {
     let external = TempDirectory::new();
     let backup = TempDirectory::new();
     let original = temp.file("directory/file", 20);
+    let expected = allocated(&temp.0) + allocated(&temp.0.join("directory")) + allocated(&original);
     external.file("file", 999);
     let directory = temp.0.join("directory");
     let moved = backup.0.join("original");
@@ -470,7 +545,7 @@ fn metadata_stays_relative_to_the_open_directory_after_path_replacement() {
     let results = collect(&temp.0, &fs);
     assert_eq!(results.state, ScanState::Complete);
     assert_eq!(results.files, 1);
-    assert_eq!(results.nodes[0].bytes, 20);
+    assert_eq!(results.nodes[0].bytes, expected);
 }
 
 #[test]
@@ -480,6 +555,9 @@ fn the_selected_root_is_anchored_even_if_its_path_is_replaced() {
     let external = TempDirectory::new();
     let backup = TempDirectory::new();
     temp.file("nested/known", 20);
+    let expected = allocated(&temp.0)
+        + allocated(&temp.0.join("nested"))
+        + allocated(&temp.0.join("nested/known"));
     external.file("outside", 999);
     let root = temp.0.clone();
     let moved = backup.0.join("original");
@@ -497,7 +575,7 @@ fn the_selected_root_is_anchored_even_if_its_path_is_replaced() {
     let results = collect(&temp.0, &fs);
     assert_eq!(results.state, ScanState::Complete);
     assert_eq!(results.files, 1);
-    assert_eq!(results.nodes[0].bytes, 20);
+    assert_eq!(results.nodes[0].bytes, expected);
 }
 
 #[test]
@@ -569,15 +647,21 @@ fn receiver_disconnection_stops_traversal_immediately() {
 }
 
 #[test]
-fn sparse_files_and_unusual_names_keep_their_logical_size_and_exact_path() {
+fn sparse_files_keep_only_written_blocks_and_their_exact_path() {
     let temp = TempDirectory::new();
     let path = temp.0.join("Unicode 空格 'quotes'\n.bin");
-    let file = fs::File::create(&path).unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = fs::File::create(&path).unwrap();
     file.set_len(5 * 1024 * 1024 * 1024).unwrap();
+    file.write_all(&[1; 4096]).unwrap();
+    file.seek(SeekFrom::End(-4096)).unwrap();
+    file.write_all(&[2; 4096]).unwrap();
     let results = collect_real(&temp.0);
     assert_eq!(results.state, ScanState::Complete);
     assert_eq!(results.files, 1);
-    assert_eq!(node(&results, &path).bytes, 5 * 1024 * 1024 * 1024);
+    assert_allocated_totals(&results);
+    assert!(node(&results, &path).bytes > 0);
+    assert!(node(&results, &path).bytes < fs::metadata(&path).unwrap().len());
 }
 
 #[test]
@@ -614,7 +698,7 @@ fn deep_directory_traversal_does_not_hold_a_descriptor_for_each_ancestor() {
     assert_eq!(results.state, ScanState::Complete);
     assert_eq!(results.directories, 161);
     assert_eq!(results.files, 1);
-    assert_eq!(results.nodes[0].bytes, 23);
+    assert_allocated_totals(&results);
     assert!(results.nodes.iter().all(|node| node.is_complete()));
 }
 
@@ -651,10 +735,7 @@ fn large_directory_worker_pipeline() {
     let elapsed = started.elapsed();
     assert_eq!(results.state, ScanState::Complete);
     assert_eq!(results.files, FILES);
-    assert_eq!(
-        results.nodes[0].bytes,
-        (0..FILES).map(|n| (n % 8192) as u64).sum::<u64>()
-    );
+    assert_allocated_totals(&results);
     assert!(results.nodes.iter().all(|node| node.is_complete()));
     assert!(results.issues.is_empty());
     assert_eq!(directory.sorted(), sorted_children(&results, 0));
@@ -666,8 +747,7 @@ fn large_directory_worker_pipeline() {
 }
 
 #[test]
-fn a_sparse_image_can_exceed_volume_capacity_without_being_counted_twice() {
-    use std::os::unix::fs::MetadataExt;
+fn a_terabyte_sparse_image_is_charged_only_its_allocated_blocks() {
     let temp = TempDirectory::new();
     let image = temp.0.join("virtual-disk.raw");
     let logical_bytes = 1024_u64.pow(4);
@@ -682,10 +762,147 @@ fn a_sparse_image_can_exceed_volume_capacity_without_being_counted_twice() {
     assert_eq!(results.state, ScanState::Complete);
     assert_eq!(results.files, 1);
     assert_eq!(results.nodes.len(), 2);
-    assert_eq!(results.nodes[0].bytes, logical_bytes);
-    assert_eq!(node(&results, &image).bytes, metadata.len());
-    assert!(results.nodes[0].bytes > 512_000_000_000);
+    assert_eq!(node(&results, &image).bytes, allocated_bytes);
+    assert_allocated_totals(&results);
+    assert!(metadata.len() > 512_000_000_000);
+    assert!(results.nodes[0].bytes < 512_000_000_000);
     assert!(allocated_bytes < logical_bytes);
     assert_eq!(metadata.nlink(), 1);
     assert!(results.issues.is_empty());
+}
+
+#[test]
+fn directory_own_allocation_is_included_even_when_it_has_no_file_bytes() {
+    let temp = TempDirectory::new();
+    let file = temp.file("child/file", 3);
+    fs::create_dir(temp.0.join("empty")).unwrap();
+    let root = temp.0.clone();
+    let fs = TestFileSystem {
+        metadata_override: Rc::new(move |path, mut metadata| {
+            if metadata.kind == EntryKind::Directory {
+                metadata.allocated_bytes = if path == root { 1024 } else { 512 };
+            }
+            metadata
+        }),
+        ..TestFileSystem::new(&temp.0)
+    };
+    let results = collect(&temp.0, &fs);
+    assert_eq!(results.state, ScanState::Complete);
+    assert_eq!(results.nodes[0].bytes, 1024 + 512 + 512 + allocated(&file));
+    assert_eq!(
+        node(&results, &temp.0.join("child")).bytes,
+        512 + allocated(&file)
+    );
+    assert_eq!(node(&results, &temp.0.join("empty")).bytes, 512);
+    assert!(results.nodes.iter().all(|node| node.is_complete()));
+}
+
+#[test]
+fn matching_inodes_on_different_devices_are_not_deduplicated() {
+    let temp = TempDirectory::new();
+    let a = temp.file("a", 11);
+    let b = temp.file("b", 11);
+    let fs = TestFileSystem {
+        metadata_override: Rc::new(|path, mut metadata| {
+            if metadata.kind == EntryKind::File {
+                metadata.identity.inode = 42;
+                metadata.identity.device = if path.file_name().unwrap() == "a" {
+                    1
+                } else {
+                    2
+                };
+            }
+            metadata
+        }),
+        ..TestFileSystem::new(&temp.0)
+    };
+    let results = collect(&temp.0, &fs);
+    assert_eq!(results.state, ScanState::Complete);
+    assert_eq!(results.files, 2);
+    assert_eq!(results.hard_links, 0);
+    assert_eq!(
+        results.nodes[0].bytes,
+        allocated(&temp.0) + allocated(&a) + allocated(&b)
+    );
+    assert_allocated_totals(&results);
+}
+
+#[test]
+fn cancelling_after_a_hard_link_preserves_only_one_allocation() {
+    let temp = TempDirectory::new();
+    let original = temp.file("original", 37);
+    fs::hard_link(&original, temp.0.join("alias")).unwrap();
+    fs::create_dir(temp.0.join("nested")).unwrap();
+    fs::hard_link(&original, temp.0.join("nested/alias")).unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut results = ScanResults::default();
+    scan(
+        &temp.0,
+        &cancel,
+        &RootFileSystem::open(&temp.0).unwrap(),
+        &mut |event| {
+            results.apply(event);
+            if results.files == 2 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            true
+        },
+    );
+    assert_eq!(results.state, ScanState::Partial);
+    assert_eq!(results.files, 2);
+    assert_eq!(results.hard_links, 1);
+    assert_allocated_totals(&results);
+    assert!(!results.nodes[0].is_complete());
+    let rescanned = collect_real(&temp.0);
+    assert_eq!(rescanned.state, ScanState::Complete);
+    assert_eq!(rescanned.files, 3);
+    assert_eq!(rescanned.hard_links, 2);
+    assert_allocated_totals(&rescanned);
+}
+
+#[test]
+fn hard_link_deduplication_survives_worker_batch_boundaries() {
+    use crate::analysis::{DirectoryIndex, LargeFileIndex};
+    let temp = TempDirectory::new();
+    let original = temp.file("original", 37);
+    for id in 0..300 {
+        fs::hard_link(&original, temp.0.join(format!("alias-{id}"))).unwrap();
+    }
+    let job = ScanJob::start(temp.0.clone()).unwrap();
+    let mut results = ScanResults {
+        state: ScanState::Scanning,
+        ..Default::default()
+    };
+    let mut files = LargeFileIndex::default();
+    let mut directory = DirectoryIndex::default();
+    directory.select(&results, 0);
+    let mut batches = 0;
+    while results.state == ScanState::Scanning {
+        let batch = job.updates.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(!batch.is_empty() && batch.len() <= 128);
+        let changes = results.apply_batch(batch);
+        files.update(&results);
+        directory.update(&results, &changes);
+        batches += 1;
+    }
+    assert!(batches >= 3);
+    assert_eq!(results.state, ScanState::Complete);
+    assert_eq!(results.files, 301);
+    assert_eq!(results.hard_links, 300);
+    assert_eq!(
+        results.nodes[0].bytes,
+        allocated(&temp.0) + allocated(&original)
+    );
+    assert_allocated_totals(&results);
+    let owners = files.matching(0);
+    assert_eq!(owners.len(), 1);
+    for node in results
+        .nodes
+        .iter()
+        .filter(|node| node.hard_link_to.is_some())
+    {
+        assert_eq!(node.hard_link_to, Some(owners[0]));
+    }
+    assert_eq!(directory.sorted().len(), 301);
+    assert_eq!(directory.sorted(), sorted_children(&results, 0));
 }
