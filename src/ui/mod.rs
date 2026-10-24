@@ -35,7 +35,6 @@ pub struct AppView {
     job: Option<ScanJob>,
     poll_task: Option<Task<()>>,
     directory: NodeId,
-    visible: Vec<NodeId>,
     views: HashMap<NodeId, DirectoryView>,
     history: Vec<NodeId>,
     page: Page,
@@ -62,7 +61,6 @@ impl Default for AppView {
             job: None,
             poll_task: None,
             directory: 0,
-            visible: Vec::new(),
             views: HashMap::new(),
             history: Vec::new(),
             page: Page::Directory,
@@ -102,10 +100,7 @@ impl AppView {
                 return;
             }
         };
-        self.results = ScanResults {
-            state: ScanState::Scanning,
-            ..Default::default()
-        };
+        self.results = ScanResults::scanning();
         self.job = Some(job);
         self.scan_root = Some(path.clone());
         self.disk_space = None;
@@ -122,7 +117,6 @@ impl AppView {
             });
         }));
         self.directory = 0;
-        self.visible.clear();
         self.visible_dirty = false;
         self.views.clear();
         self.views.insert(0, DirectoryView::default());
@@ -168,9 +162,11 @@ impl AppView {
     }
 
     fn capacity_notice(&self) -> Option<&'static str> {
-        let root = self.results.nodes.first()?;
         let space = self.disk_space.as_ref()?.as_ref().ok()?;
-        (!root.size_overflow && root.bytes > space.capacity).then_some(
+        (!self.results.is_empty()
+            && !self.results.root_overflow()
+            && self.results.root_bytes() > space.capacity)
+            .then_some(
             "已分配空间总量超过所选卷容量；APFS 共享数据或跨卷扫描可能造成差异，此数值不代表可释放空间。",
         )
     }
@@ -192,7 +188,7 @@ impl AppView {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if self.results.state == ScanState::Scanning {
-                        self.results.state = if self.results.nodes.is_empty() {
+                        self.results.state = if self.results.is_empty() {
                             ScanState::Failed
                         } else {
                             ScanState::Partial
@@ -281,14 +277,28 @@ impl AppView {
         match self.page {
             Page::Directory => {
                 self.directory_index.select(&self.results, self.directory);
-                self.directory_index.write_sorted(&mut self.visible);
+                self.directory_index.sync(&self.results);
             }
-            Page::LargeFiles => self.large_files.write_matching(
-                &self.results,
-                self.minimum_bytes,
-                &mut self.visible,
-            ),
-            Page::Issues => self.visible.clear(),
+            Page::LargeFiles => self.large_files.sync(&self.results, self.minimum_bytes),
+            Page::Issues => {}
+        }
+    }
+
+    fn visible_len(&self) -> usize {
+        match self.page {
+            Page::Directory => self.directory_index.len(),
+            Page::LargeFiles => self
+                .large_files
+                .visible_len(&self.results, self.minimum_bytes),
+            Page::Issues => 0,
+        }
+    }
+
+    fn visible_id(&self, index: usize) -> NodeId {
+        match self.page {
+            Page::Directory => self.directory_index.id(index),
+            Page::LargeFiles => self.large_files.visible_id(self.minimum_bytes, index),
+            Page::Issues => 0,
         }
     }
 
@@ -313,11 +323,12 @@ impl AppView {
     fn open_parent(&mut self) {
         if self.page == Page::LargeFiles
             && let Some(id) = self.selected()
-            && let Some(parent) = self.results.nodes[id].parent()
+            && let Some(parent) = self.results.parent(id)
         {
             self.navigate_to(parent, true);
             self.views.entry(parent).or_default().selected = Some(id);
-            if let Some(index) = self.visible.iter().position(|item| *item == id) {
+            if let Some(index) = (0..self.visible_len()).find(|index| self.visible_id(*index) == id)
+            {
                 self.views
                     .entry(parent)
                     .or_default()
@@ -343,7 +354,7 @@ impl AppView {
         if self.revealing {
             return;
         }
-        let path = self.results.nodes[id].path.to_path_buf();
+        let path = self.results.to_path_buf(id);
         self.revealing = true;
         self.notice = None;
         cx.spawn(async move |this, cx| {
@@ -364,23 +375,19 @@ impl AppView {
     }
 
     fn entry_description(&self, id: NodeId) -> String {
-        let node = &self.results.nodes[id];
-        if let Some(owner) = node.hard_link_to() {
-            return format!(
-                "硬链接 · 已计入 {}",
-                self.results.nodes[owner].path.display()
-            );
+        if let Some(owner) = self.results.hard_link_to(id) {
+            return format!("硬链接 · 已计入 {}", self.results.path(owner).display());
         }
         if self.page == Page::LargeFiles {
-            return node.path.display().to_string();
+            return self.results.path(id).display().to_string();
         }
-        let status = match node.kind {
+        let status = match self.results.kind(id) {
             EntryKind::Symlink => "符号链接 · 已跳过",
             EntryKind::Other => "特殊文件 · 已跳过",
-            EntryKind::Directory if node.size_overflow => "已分配空间超出统计范围",
-            EntryKind::Directory if node.errors() > 0 => "含读取失败项",
-            EntryKind::Directory if !node.is_complete() => "尚未扫描完整",
-            EntryKind::Directory if node.children().is_empty() => "空目录",
+            EntryKind::Directory if self.results.size_overflow(id) => "已分配空间超出统计范围",
+            EntryKind::Directory if self.results.errors(id) > 0 => "含读取失败项",
+            EntryKind::Directory if !self.results.is_complete(id) => "尚未扫描完整",
+            EntryKind::Directory if self.results.child_count(id) == 0 => "空目录",
             EntryKind::Directory => "目录 · 双击进入",
             EntryKind::File => "文件",
         };
@@ -388,41 +395,35 @@ impl AppView {
     }
 
     fn entry_size(&self, id: NodeId) -> String {
-        let node = &self.results.nodes[id];
-        if node.hard_link_to().is_some() {
+        if self.results.hard_link_to(id).is_some() {
             "已去重".into()
-        } else if node.size_overflow {
+        } else if self.results.size_overflow(id) {
             "超出范围".into()
         } else {
-            format_bytes(node.bytes)
+            format_bytes(self.results.bytes(id))
         }
     }
 
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let id = self.visible[index];
-        let node = &self.results.nodes[id];
+        let id = self.visible_id(index);
         let selected = self.selected() == Some(id);
         let large_file = self.page == Page::LargeFiles;
-        let is_directory = node.kind == EntryKind::Directory;
-        let prefix = match node.kind {
+        let kind = self.results.kind(id);
+        let is_directory = kind == EntryKind::Directory;
+        let prefix = match kind {
             EntryKind::Directory => "▸",
             EntryKind::File => "·",
             EntryKind::Symlink => "↗",
             EntryKind::Other => "–",
         };
-        let name = node
-            .path
-            .file_name()
-            .unwrap_or(node.path.name())
-            .to_string_lossy()
-            .into_owned();
+        let name = self.results.name(id).to_string_lossy().into_owned();
         let description = self.entry_description(id);
-        let denominator = &self.results.nodes[if large_file { 0 } else { self.directory }];
-        let total = denominator.bytes;
+        let denominator = if large_file { 0 } else { self.directory };
+        let total = self.results.bytes(denominator);
         let ratio = if total == 0 {
             0.0
         } else {
-            node.bytes as f32 / total as f32
+            self.results.bytes(id) as f32 / total as f32
         };
         div()
             .id(id)
@@ -466,7 +467,7 @@ impl AppView {
                             .child(description),
                     ),
             )
-            .child(if denominator.size_overflow {
+            .child(if self.results.size_overflow(denominator) {
                 div()
                     .w(px(110.0))
                     .text_xs()
@@ -503,21 +504,23 @@ impl Render for AppView {
             .scan_root
             .as_ref()
             .map(|path| path.display().to_string());
-        let allocated_size = match self.results.nodes.first() {
-            Some(node) if node.size_overflow => "已分配空间超出统计范围".into(),
-            Some(node) => format_bytes(node.bytes),
-            None => format_bytes(0),
+        let allocated_size = if self.results.is_empty() {
+            format_bytes(0)
+        } else if self.results.root_overflow() {
+            "已分配空间超出统计范围".into()
+        } else {
+            format_bytes(self.results.root_bytes())
         };
-        let current = self.results.nodes.get(self.directory);
+        let has_current = !self.results.is_empty() && self.directory < self.results.len();
         let mut ancestors = Vec::new();
-        let mut ancestor = current.map(|_| self.directory);
+        let mut ancestor = has_current.then_some(self.directory);
         while let Some(id) = ancestor {
             ancestors.push(id);
-            ancestor = self.results.nodes[id].parent();
+            ancestor = self.results.parent(id);
         }
         ancestors.reverse();
         let selected = self.selected();
-        let selected_path = selected.map(|id| self.results.nodes[id].path.clone());
+        let selected_path = selected.map(|id| self.results.to_path_buf(id));
         let content = if self.page == Page::Issues && self.results.issues.is_empty() {
             div()
                 .flex_1()
@@ -565,16 +568,14 @@ impl Render for AppView {
                     .track_scroll(&self.issue_scroll),
                 )
                 .into_any_element()
-        } else if self.visible.is_empty() {
+        } else if self.visible_len() == 0 {
             let message = match self.results.state {
                 ScanState::Idle => "选择主目录、下载目录或其他目录开始分析。",
                 ScanState::Scanning => "正在发现目录内容…",
                 ScanState::Failed => "无法完成扫描，请查看扫描问题。",
-                ScanState::Partial if self.results.nodes.is_empty() => {
-                    "扫描已取消，尚未发现目录内容。"
-                }
+                ScanState::Partial if self.results.is_empty() => "扫描已取消，尚未发现目录内容。",
                 _ if self.page == Page::LargeFiles => "已发现的文件中没有符合当前大小条件的条目。",
-                _ if current.is_some_and(|node| !node.is_complete()) => {
+                _ if has_current && !self.results.is_complete(self.directory) => {
                     "该目录未扫描完整，不能视为空目录。"
                 }
                 _ => "此目录为空。",
@@ -605,7 +606,7 @@ impl Render for AppView {
                                 self.directory
                             },
                         ),
-                        self.visible.len(),
+                        self.visible_len(),
                         cx.processor(|this, range: Range<usize>, _, cx| {
                             range.map(|index| this.render_row(index, cx)).collect()
                         }),
@@ -662,13 +663,13 @@ impl Render for AppView {
             .child(
                 Button::new("overview")
                     .label("目录分析")
-                    .disabled(self.results.nodes.is_empty())
+                    .disabled(self.results.is_empty())
                     .on_click(cx.listener(|this, _, _, cx| this.show_page(Page::Directory, cx))),
             )
             .child(
                 Button::new("large-files")
                     .label("大文件")
-                    .disabled(self.results.nodes.is_empty())
+                    .disabled(self.results.is_empty())
                     .on_click(cx.listener(|this, _, _, cx| this.show_page(Page::LargeFiles, cx))),
             )
             .child(
@@ -726,14 +727,10 @@ impl Render for AppView {
             .children(self.notice.clone().map(|notice| div().text_sm().child(notice)));
 
         let crumbs = ancestors.into_iter().map(|id| {
-            let path = &self.results.nodes[id].path;
             let name = if id == 0 {
                 "扫描根目录".to_string()
             } else {
-                path.file_name()
-                    .unwrap_or(path.name())
-                    .to_string_lossy()
-                    .into_owned()
+                self.results.name(id).to_string_lossy().into_owned()
             };
             Button::new(("breadcrumb", id))
                 .label(name)

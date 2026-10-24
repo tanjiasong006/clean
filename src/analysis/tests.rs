@@ -5,7 +5,17 @@ fn entry(results: &mut ScanResults, path: &str, kind: EntryKind, bytes: u64) {
     results.apply(ScanEvent::Entry {
         hard_link_to: None,
         path: path.into(),
-        parent: (!results.nodes.is_empty()).then_some(0),
+        parent: (!results.is_empty()).then_some(0),
+        kind,
+        bytes,
+    });
+}
+
+fn child(results: &mut ScanResults, parent: NodeId, path: &str, kind: EntryKind, bytes: u64) {
+    results.apply(ScanEvent::Entry {
+        hard_link_to: None,
+        path: path.into(),
+        parent: Some(parent),
         kind,
         bytes,
     });
@@ -29,24 +39,36 @@ fn large_files_include_boundary_and_sort_ties_by_path() {
 }
 
 #[test]
+fn large_file_index_keeps_only_files_at_or_above_the_floor() {
+    let mut results = ScanResults::default();
+    entry(&mut results, "/root", EntryKind::Directory, 0);
+    entry(
+        &mut results,
+        "/root/large",
+        EntryKind::File,
+        LARGE_FILE_FLOOR + 512,
+    );
+    entry(&mut results, "/root/small", EntryKind::File, 1024);
+    let mut index = LargeFileIndex::default();
+    index.update(&results);
+    assert_eq!(index.entries, vec![1]);
+    assert_eq!(index.matching(&results, LARGE_FILE_FLOOR), vec![1]);
+    assert_eq!(index.matching(&results, 0), vec![1, 2]);
+}
+
+#[test]
 fn index_adds_nested_files_without_duplicates_and_keeps_partial_results() {
     let mut results = ScanResults::default();
     let mut index = LargeFileIndex::default();
     index.update(&results);
     assert!(index.matching(&results, 0).is_empty());
     entry(&mut results, "/root", EntryKind::Directory, 0);
-    entry(&mut results, "/root/nested", EntryKind::Directory, 0);
-    results.apply(ScanEvent::Entry {
-        hard_link_to: None,
-        path: "/root/nested/file".into(),
-        parent: Some(1),
-        kind: EntryKind::File,
-        bytes: 200,
-    });
+    child(&mut results, 0, "/root/nested", EntryKind::Directory, 0);
+    child(&mut results, 1, "/root/nested/file", EntryKind::File, 200);
     index.update(&results);
     index.update(&results);
     assert_eq!(index.matching(&results, 100), vec![2]);
-    entry(&mut results, "/root/new", EntryKind::File, 400);
+    child(&mut results, 1, "/root/nested/new", EntryKind::File, 400);
     results.apply(ScanEvent::Finished(ScanState::Partial));
     index.update(&results);
     assert_eq!(index.matching(&results, 100), vec![3, 2]);
@@ -66,19 +88,22 @@ fn byte_formatting_uses_binary_units() {
 fn directory_index_tracks_aggregate_size_changes_and_navigation() {
     let mut results = ScanResults::default();
     entry(&mut results, "/root", EntryKind::Directory, 0);
-    entry(&mut results, "/root/z", EntryKind::Directory, 0);
-    entry(&mut results, "/root/a", EntryKind::Directory, 0);
+    child(&mut results, 0, "/root/z", EntryKind::Directory, 0);
+    child(&mut results, 0, "/root/a", EntryKind::Directory, 0);
+    results.apply_batch([ScanEvent::DirectoryRead(0)]);
     let mut index = DirectoryIndex::default();
     index.select(&results, 0);
-    assert_eq!(index.sorted(), sorted_children(&results, 0));
+    // Both directories start at zero bytes, so names decide the order.
+    assert_eq!(index.sorted(&results), vec![2, 1]);
     let changes = results.apply_batch([
         ScanEvent::Entry {
             hard_link_to: None,
             path: "/root/z/large".into(),
             parent: Some(1),
             kind: EntryKind::File,
-            bytes: 100,
+            bytes: 300,
         },
+        ScanEvent::DirectoryRead(1),
         ScanEvent::Entry {
             hard_link_to: None,
             path: "/root/a/small".into(),
@@ -86,18 +111,6 @@ fn directory_index_tracks_aggregate_size_changes_and_navigation() {
             kind: EntryKind::File,
             bytes: 20,
         },
-        ScanEvent::Entry {
-            hard_link_to: None,
-            path: "/root/top".into(),
-            parent: Some(0),
-            kind: EntryKind::File,
-            bytes: 50,
-        },
-    ]);
-    index.update(&results, &changes);
-    assert_eq!(index.sorted(), vec![1, 5, 2]);
-    assert_eq!(index.sorted(), sorted_children(&results, 0));
-    let changes = results.apply_batch([
         ScanEvent::Entry {
             hard_link_to: None,
             path: "/root/a/new".into(),
@@ -108,36 +121,32 @@ fn directory_index_tracks_aggregate_size_changes_and_navigation() {
         ScanEvent::DirectoryRead(2),
     ]);
     index.update(&results, &changes);
-    assert_eq!(index.sorted(), vec![2, 1, 5]);
+    assert_eq!(index.sorted(&results), vec![1, 2]);
+    assert_eq!(index.sorted(&results), sorted_children(&results, 0));
     index.select(&results, 2);
-    assert_eq!(index.sorted(), vec![6, 4]);
+    assert_eq!(index.sorted(&results), vec![5, 4]);
+    index.select(&results, 1);
+    assert_eq!(index.sorted(&results), vec![3]);
     index.select(&results, 0);
-    assert_eq!(index.sorted(), sorted_children(&results, 0));
+    assert_eq!(index.sorted(&results), sorted_children(&results, 0));
 }
 
 #[test]
-fn size_indexes_share_node_paths_instead_of_copying_their_contents() {
+fn directory_index_stores_four_byte_ids() {
     let mut results = ScanResults::default();
     entry(&mut results, "/root", EntryKind::Directory, 0);
-    entry(&mut results, "/root/file", EntryKind::File, 100);
-    let mut files = LargeFileIndex::default();
-    files.update(&results);
-    let mut directory = DirectoryIndex::default();
-    directory.select(&results, 0);
-    let SizeIndex::Live(files) = &files.files else {
-        panic!("live file index")
-    };
-    let SizeIndex::Live(entries) = &directory.entries else {
-        panic!("live directory index")
-    };
-    assert!(Arc::ptr_eq(
-        &results.nodes[1].path,
-        &files.first().unwrap().1
-    ));
-    assert!(Arc::ptr_eq(
-        &results.nodes[1].path,
-        &entries.first().unwrap().1
-    ));
+    for id in 0..64 {
+        entry(
+            &mut results,
+            &format!("/root/file-{id}"),
+            EntryKind::File,
+            id,
+        );
+    }
+    let mut index = DirectoryIndex::default();
+    index.select(&results, 0);
+    assert_eq!(index.entries.len(), 64);
+    assert_eq!(std::mem::size_of_val(&index.entries[0]), 4);
 }
 
 #[test]
@@ -161,21 +170,17 @@ fn large_file_index_excludes_hard_link_aliases_but_keeps_zero_allocation_files()
     assert_eq!(index.matching(&results, 1), vec![1]);
     assert_eq!(results.files, 3);
     assert_eq!(results.hard_links, 1);
-    assert_eq!(results.nodes[0].bytes, 512 + 4096);
+    assert_eq!(results.bytes(0), 512 + 4096);
     results.apply(ScanEvent::Finished(ScanState::Partial));
     index.update(&results);
-    assert!(matches!(index.files, SizeIndex::Finished(_)));
     assert_eq!(index.matching(&results, 0), vec![1, 2]);
     assert_eq!(index.matching(&results, 1), vec![1]);
 }
 
 #[test]
-fn terminal_states_compact_both_indexes_and_release_path_references() {
+fn terminal_states_keep_compact_index_results_stable() {
     for state in [ScanState::Complete, ScanState::Partial, ScanState::Failed] {
-        let mut results = ScanResults {
-            state: ScanState::Scanning,
-            ..Default::default()
-        };
+        let mut results = ScanResults::scanning();
         entry(&mut results, "/root", EntryKind::Directory, 0);
         entry(&mut results, "/root/z", EntryKind::File, 100);
         entry(&mut results, "/root/a", EntryKind::File, 100);
@@ -183,7 +188,6 @@ fn terminal_states_compact_both_indexes_and_release_path_references() {
         files.update(&results);
         let mut directory = DirectoryIndex::default();
         directory.select(&results, 0);
-        assert_eq!(Arc::strong_count(&results.nodes[1].path), 3);
         let changes = results.apply_batch([
             ScanEvent::Entry {
                 path: "/root/largest".into(),
@@ -196,23 +200,13 @@ fn terminal_states_compact_both_indexes_and_release_path_references() {
         ]);
         files.update(&results);
         directory.update(&results, &changes);
-        let SizeIndex::Finished(ids) = &files.files else {
-            panic!("compact file index")
-        };
-        assert_eq!(ids, &[3, 2, 1]);
-        assert_eq!(ids.capacity(), ids.len());
-        let SizeIndex::Finished(ids) = &directory.entries else {
-            panic!("compact directory index")
-        };
-        assert_eq!(ids, &[3, 2, 1]);
-        assert_eq!(ids.capacity(), ids.len());
-        assert_eq!(Arc::strong_count(&results.nodes[1].path), 1);
         assert_eq!(files.matching(&results, 100), vec![3, 2, 1]);
         assert_eq!(files.matching(&results, 101), vec![3]);
         assert!(files.matching(&results, 201).is_empty());
+        assert_eq!(directory.sorted(&results), vec![3, 2, 1]);
         files.update(&results);
         directory.update(&results, &[]);
-        assert_eq!(directory.sorted(), vec![3, 2, 1]);
+        assert_eq!(directory.sorted(&results), vec![3, 2, 1]);
     }
 }
 
@@ -220,8 +214,8 @@ fn terminal_states_compact_both_indexes_and_release_path_references() {
 fn finished_directory_navigation_builds_only_id_vectors() {
     let mut results = ScanResults::default();
     entry(&mut results, "/root", EntryKind::Directory, 0);
-    entry(&mut results, "/root/z", EntryKind::Directory, 0);
-    entry(&mut results, "/root/a", EntryKind::Directory, 0);
+    child(&mut results, 0, "/root/z", EntryKind::Directory, 0);
+    child(&mut results, 0, "/root/a", EntryKind::Directory, 0);
     results.apply_batch([
         ScanEvent::Entry {
             path: "/root/z/file".into(),
@@ -242,8 +236,8 @@ fn finished_directory_navigation_builds_only_id_vectors() {
     let mut directory = DirectoryIndex::default();
     for (id, expected) in [(0, vec![2, 1]), (1, vec![3]), (2, vec![4]), (0, vec![2, 1])] {
         directory.select(&results, id);
-        assert!(matches!(directory.entries, SizeIndex::Finished(_)));
-        assert_eq!(directory.sorted(), expected);
+        assert_eq!(directory.sorted(&results), expected);
+        assert_eq!(std::mem::size_of_val(&directory.entries[0]), 4);
     }
     let mut files = LargeFileIndex::default();
     files.update(&results);
@@ -260,14 +254,14 @@ fn index_outputs_reuse_existing_buffer_before_and_after_completion() {
     files.update(&results);
     let mut directory = DirectoryIndex::default();
     directory.select(&results, 0);
-    let mut output = Vec::with_capacity(16);
+    let mut output: Vec<u32> = Vec::with_capacity(16);
     let pointer = output.as_ptr();
     let capacity = output.capacity();
     for state in [ScanState::Idle, ScanState::Complete] {
         results.state = state;
         files.update(&results);
         directory.update(&results, &[]);
-        directory.write_sorted(&mut output);
+        directory.write_sorted(&results, &mut output);
         assert_eq!(output, vec![1, 2]);
         assert_eq!(output.as_ptr(), pointer);
         assert_eq!(output.capacity(), capacity);

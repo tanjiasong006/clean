@@ -1,15 +1,19 @@
-use std::{cmp::Reverse, collections::BTreeSet, sync::Arc};
+use std::cmp::Ordering;
 
-use crate::models::{NodeChange, NodeId, NodePath, ScanResults, ScanState};
+use crate::models::{EntryKind, NodeChange, NodeId, ScanResults};
 
-#[cfg(test)]
-pub fn sorted_children(results: &ScanResults, directory: NodeId) -> Vec<NodeId> {
-    let Some(node) = results.nodes.get(directory) else {
-        return Vec::new();
-    };
-    let mut children = node.children().to_vec();
-    sort_nodes(results, &mut children);
-    children
+/// Files at or above this size stay in the incremental large-file index. Smaller
+/// files are found by scanning node storage on demand, so the index cannot grow
+/// with the number of ordinary files.
+pub const LARGE_FILE_FLOOR: u64 = 100 * 1024 * 1024;
+
+const INDEX_CHUNK: usize = 1 << 16;
+
+fn push_id(ids: &mut Vec<u32>, id: NodeId) {
+    if ids.len() == ids.capacity() {
+        ids.reserve_exact(INDEX_CHUNK);
+    }
+    ids.push(id as u32);
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -27,130 +31,140 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Children of one directory share a name prefix, so their suffixes alone give
+/// path order. Sizes are compared as 64-bit so escaped values stay exact.
+fn compare_siblings(results: &ScanResults, left: NodeId, right: NodeId) -> Ordering {
+    results
+        .bytes(right)
+        .cmp(&results.bytes(left))
+        .then_with(|| results.name_suffix(left).cmp(&results.name_suffix(right)))
+        .then_with(|| left.cmp(&right))
+}
+
+fn compare_paths(results: &ScanResults, left: NodeId, right: NodeId) -> Ordering {
+    results
+        .bytes(right)
+        .cmp(&results.bytes(left))
+        .then_with(|| results.cmp_path(left, right))
+        .then_with(|| left.cmp(&right))
+}
+
+#[cfg(test)]
+pub fn sorted_children(results: &ScanResults, directory: NodeId) -> Vec<NodeId> {
+    let mut children: Vec<NodeId> = results.child_ids(directory).collect();
+    children.sort_unstable_by(|left, right| compare_siblings(results, *left, *right));
+    children
+}
+
 #[derive(Default)]
 pub struct LargeFileIndex {
-    files: SizeIndex,
     indexed_nodes: usize,
+    entries: Vec<u32>,
+    sorted: bool,
+    all: Option<Vec<u32>>,
 }
 
 impl LargeFileIndex {
     pub fn update(&mut self, results: &ScanResults) {
-        let SizeIndex::Live(files) = &mut self.files else {
+        if self.indexed_nodes > results.len() {
+            self.reset();
             return;
-        };
-        for (id, node) in results.nodes.iter().enumerate().skip(self.indexed_nodes) {
-            if node.kind == crate::models::EntryKind::File && node.hard_link_to().is_none() {
-                files.insert(size_key(results, id));
+        }
+        for id in self.indexed_nodes..results.len() {
+            if results.kind(id) == EntryKind::File
+                && results.hard_link_to(id).is_none()
+                && results.bytes(id) >= LARGE_FILE_FLOOR
+            {
+                push_id(&mut self.entries, id);
+                self.sorted = false;
             }
         }
-        self.indexed_nodes = results.nodes.len();
-        self.files.finish(results.state);
+        if self.indexed_nodes != results.len() {
+            self.indexed_nodes = results.len();
+            self.all = None;
+        }
     }
 
-    pub fn write_matching(
-        &self,
-        results: &ScanResults,
-        minimum_bytes: u64,
-        output: &mut Vec<NodeId>,
-    ) {
-        output.clear();
-        match &self.files {
-            SizeIndex::Live(files) => output.extend(
-                files
-                    .iter()
-                    .take_while(|(size, _, _)| size.0 >= minimum_bytes)
-                    .map(|(_, _, id)| *id),
-            ),
-            SizeIndex::Finished(files) => output.extend(
-                files
-                    .iter()
-                    .copied()
-                    .take_while(|id| results.nodes[*id].bytes >= minimum_bytes),
-            ),
+    fn reset(&mut self) {
+        self.indexed_nodes = 0;
+        self.entries.clear();
+        self.sorted = true;
+        self.all = None;
+    }
+
+    /// Prepares the sorted list for a threshold. No filtered copy is kept:
+    /// files at or above the threshold are a prefix of the size-descending list.
+    pub fn sync(&mut self, results: &ScanResults, minimum_bytes: u64) {
+        if minimum_bytes >= LARGE_FILE_FLOOR {
+            if !self.sorted {
+                self.entries.sort_unstable_by(|left, right| {
+                    compare_paths(results, *left as usize, *right as usize)
+                });
+                self.sorted = true;
+            }
+            return;
         }
+        if self.all.is_none() {
+            let mut ids = Vec::new();
+            for id in 0..results.len() {
+                if results.kind(id) == EntryKind::File && results.hard_link_to(id).is_none() {
+                    push_id(&mut ids, id);
+                }
+            }
+            ids.sort_unstable_by(|left, right| {
+                compare_paths(results, *left as usize, *right as usize)
+            });
+            self.all = Some(ids);
+        }
+    }
+
+    fn list(&self, minimum_bytes: u64) -> &[u32] {
+        if minimum_bytes >= LARGE_FILE_FLOOR {
+            &self.entries
+        } else {
+            self.all.as_deref().unwrap_or(&[])
+        }
+    }
+
+    pub fn visible_len(&self, results: &ScanResults, minimum_bytes: u64) -> usize {
+        self.list(minimum_bytes)
+            .partition_point(|id| results.bytes(*id as usize) >= minimum_bytes)
+    }
+
+    pub fn visible_id(&self, minimum_bytes: u64, index: usize) -> NodeId {
+        self.list(minimum_bytes)[index] as usize
     }
 
     #[cfg(test)]
-    pub fn matching(&self, results: &ScanResults, minimum_bytes: u64) -> Vec<NodeId> {
+    pub fn write_matching(
+        &mut self,
+        results: &ScanResults,
+        minimum_bytes: u64,
+        output: &mut Vec<u32>,
+    ) {
+        self.sync(results, minimum_bytes);
+        let length = self.visible_len(results, minimum_bytes);
+        output.clear();
+        output.extend_from_slice(&self.list(minimum_bytes)[..length]);
+    }
+
+    #[cfg(test)]
+    pub fn matching(&mut self, results: &ScanResults, minimum_bytes: u64) -> Vec<NodeId> {
         let mut output = Vec::new();
         self.write_matching(results, minimum_bytes, &mut output);
-        output
+        output.into_iter().map(|id| id as usize).collect()
     }
 }
 
-type SizeKey = (Reverse<u64>, Arc<NodePath>, NodeId);
-
-enum SizeIndex {
-    Live(BTreeSet<SizeKey>),
-    Finished(Vec<NodeId>),
-}
-
-impl Default for SizeIndex {
-    fn default() -> Self {
-        Self::Live(BTreeSet::new())
-    }
-}
-
-impl SizeIndex {
-    fn finish(&mut self, state: ScanState) {
-        if !is_finished(state) {
-            return;
-        }
-        if let Self::Live(entries) = self {
-            let mut ids = Vec::with_capacity(entries.len());
-            ids.extend(std::mem::take(entries).into_iter().map(|(_, _, id)| id));
-            *self = Self::Finished(ids);
-        }
-    }
-
-    fn from_ids(results: &ScanResults, ids: impl Iterator<Item = NodeId>) -> Self {
-        if is_finished(results.state) {
-            let mut ids: Vec<_> = ids.collect();
-            sort_nodes(results, &mut ids);
-            ids.shrink_to_fit();
-            Self::Finished(ids)
-        } else {
-            Self::Live(ids.map(|id| size_key(results, id)).collect())
-        }
-    }
-
-    fn write_sorted(&self, output: &mut Vec<NodeId>) {
-        output.clear();
-        match self {
-            Self::Live(entries) => output.extend(entries.iter().map(|(_, _, id)| *id)),
-            Self::Finished(entries) => output.extend_from_slice(entries),
-        }
-    }
-}
-
-fn is_finished(state: ScanState) -> bool {
-    matches!(
-        state,
-        ScanState::Complete | ScanState::Partial | ScanState::Failed
-    )
-}
-
-fn sort_nodes(results: &ScanResults, ids: &mut [NodeId]) {
-    ids.sort_unstable_by(|a, b| {
-        let left = &results.nodes[*a];
-        let right = &results.nodes[*b];
-        right
-            .bytes
-            .cmp(&left.bytes)
-            .then_with(|| left.path.cmp(&right.path))
-            .then(a.cmp(b))
-    });
-}
-
-fn size_key(results: &ScanResults, id: NodeId) -> SizeKey {
-    let node = &results.nodes[id];
-    (Reverse(node.bytes), node.path.clone(), id)
-}
-
+/// Sorted children of the directory being viewed. New children are appended and
+/// merged; size changes in existing children trigger a full re-sort. Memory is
+/// four bytes per child, independent of the rest of the scan.
 #[derive(Default)]
 pub struct DirectoryIndex {
     directory: Option<NodeId>,
-    entries: SizeIndex,
+    entries: Vec<u32>,
+    pending: Vec<u32>,
+    dirty: bool,
 }
 
 impl DirectoryIndex {
@@ -159,50 +173,99 @@ impl DirectoryIndex {
             return;
         }
         self.directory = Some(directory);
-        self.entries = SizeIndex::from_ids(
-            results,
-            results
-                .nodes
-                .get(directory)
-                .into_iter()
-                .flat_map(|node| node.children().iter().copied()),
-        );
+        self.entries.clear();
+        for id in results.child_ids(directory) {
+            push_id(&mut self.entries, id);
+        }
+        self.pending.clear();
+        self.entries.sort_unstable_by(|left, right| {
+            compare_siblings(results, *left as usize, *right as usize)
+        });
+        self.dirty = false;
     }
 
     pub fn update(&mut self, results: &ScanResults, changes: &[NodeChange]) {
         let Some(directory) = self.directory else {
             return;
         };
-        let SizeIndex::Live(entries) = &mut self.entries else {
-            return;
-        };
+        let range = results.child_ids(directory);
         for change in changes {
-            let node = &results.nodes[change.id];
-            if node.parent() != Some(directory) {
+            if !range.contains(&change.id) {
                 continue;
             }
-            if let Some(previous) = change.previous_bytes {
-                if previous == node.bytes {
-                    continue;
-                }
-                entries.remove(&(Reverse(previous), node.path.clone(), change.id));
+            match change.previous_bytes {
+                None => push_id(&mut self.pending, change.id),
+                Some(previous) if previous != results.bytes(change.id) => self.dirty = true,
+                Some(_) => {}
             }
-            entries.insert(size_key(results, change.id));
         }
-        self.entries.finish(results.state);
     }
 
-    pub fn write_sorted(&self, output: &mut Vec<NodeId>) {
-        self.entries.write_sorted(output);
+    pub fn sync(&mut self, results: &ScanResults) {
+        self.merge(results);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn id(&self, index: usize) -> NodeId {
+        self.entries[index] as usize
     }
 
     #[cfg(test)]
-    pub fn sorted(&self) -> Vec<NodeId> {
+    pub fn write_sorted(&mut self, results: &ScanResults, output: &mut Vec<u32>) {
+        self.sync(results);
+        output.clear();
+        output.extend_from_slice(&self.entries);
+    }
+
+    fn merge(&mut self, results: &ScanResults) {
+        if self.dirty {
+            self.entries.append(&mut self.pending);
+            self.entries.sort_unstable_by(|left, right| {
+                compare_siblings(results, *left as usize, *right as usize)
+            });
+            self.dirty = false;
+            return;
+        }
+        if self.pending.is_empty() {
+            return;
+        }
+        self.pending.sort_unstable_by(|left, right| {
+            compare_siblings(results, *left as usize, *right as usize)
+        });
+        let old = self.entries.len();
+        let added = self.pending.len();
+        self.entries.reserve_exact(added);
+        self.entries.resize(old + added, 0);
+        let mut write = old + added;
+        let mut read = old;
+        let mut next = added;
+        while next > 0 {
+            // Place the entry that sorts later at the back.
+            let take_entry = read > 0
+                && compare_siblings(
+                    results,
+                    self.entries[read - 1] as usize,
+                    self.pending[next - 1] as usize,
+                ) == Ordering::Greater;
+            write -= 1;
+            if take_entry {
+                self.entries[write] = self.entries[read - 1];
+                read -= 1;
+            } else {
+                self.entries[write] = self.pending[next - 1];
+                next -= 1;
+            }
+        }
+        self.pending.clear();
+    }
+
+    #[cfg(test)]
+    pub fn sorted(&mut self, results: &ScanResults) -> Vec<NodeId> {
         let mut output = Vec::new();
-        self.write_sorted(&mut output);
-        output
+        self.write_sorted(results, &mut output);
+        output.into_iter().map(|id| id as usize).collect()
     }
 }
-
-#[cfg(test)]
-mod tests;

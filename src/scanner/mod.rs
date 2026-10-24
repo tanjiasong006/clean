@@ -2,6 +2,7 @@
 //! Allocated file bytes belong to the first observed (device, inode) path.
 use std::{
     collections::{HashMap, hash_map::Entry},
+    ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
     sync::{
@@ -13,10 +14,108 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
 use crate::{
     models::{EntryKind, ScanEvent, ScanIssue, ScanState},
-    platform::scan_fs::{FileSystem, RootFileSystem},
+    platform::scan_fs::{FileIdentity, FileSystem, RootFileSystem},
 };
+
+#[cfg(unix)]
+fn name_bytes(name: &OsStr) -> &[u8] {
+    name.as_bytes()
+}
+
+#[cfg(not(unix))]
+fn name_bytes(name: &OsStr) -> Vec<u8> {
+    name.to_string_lossy().into_owned().into_bytes()
+}
+
+#[cfg(unix)]
+fn os_from_bytes(bytes: &[u8]) -> OsString {
+    OsString::from_vec(bytes.to_vec())
+}
+
+#[cfg(not(unix))]
+fn os_from_bytes(bytes: &[u8]) -> OsString {
+    String::from_utf8_lossy(bytes).into_owned().into()
+}
+
+const NO_PARENT: u32 = u32::MAX;
+
+/// Pending directories store a parent handle and a name instead of a full
+/// path. Wide trees therefore cost one short name per discovered directory,
+/// not one copied absolute path.
+#[derive(Default)]
+struct PendingDirectories {
+    entries: Vec<PendingDirectory>,
+    names: Vec<u8>,
+    stack: Vec<u32>,
+}
+
+struct PendingDirectory {
+    parent: u32,
+    id: u32,
+    name_offset: u32,
+    name_len: u16,
+    identity: FileIdentity,
+}
+
+impl PendingDirectories {
+    fn push(&mut self, parent: u32, id: u32, name: &OsStr, identity: FileIdentity) {
+        let bytes = name_bytes(name);
+        assert!(
+            self.entries.len() < u32::MAX as usize,
+            "scan discovered too many directories"
+        );
+        assert!(
+            bytes.len() <= u16::MAX as usize,
+            "directory name exceeds compact path storage"
+        );
+        assert!(
+            self.names.len() + bytes.len() <= u32::MAX as usize,
+            "pending directory names exceed compact path storage"
+        );
+        let name_offset = self.names.len() as u32;
+        self.names.extend_from_slice(bytes);
+        let handle = self.entries.len() as u32;
+        self.entries.push(PendingDirectory {
+            parent,
+            id,
+            name_offset,
+            name_len: bytes.len() as u16,
+            identity,
+        });
+        self.stack.push(handle);
+    }
+
+    fn pop(&mut self) -> Option<(u32, u32, PathBuf, FileIdentity)> {
+        let handle = self.stack.pop()?;
+        let entry = &self.entries[handle as usize];
+        Some((handle, entry.id, self.path(handle), entry.identity))
+    }
+
+    fn path(&self, handle: u32) -> PathBuf {
+        let mut parts = Vec::new();
+        let mut current = handle;
+        loop {
+            let entry = &self.entries[current as usize];
+            let start = entry.name_offset as usize;
+            parts.push(&self.names[start..start + entry.name_len as usize]);
+            if entry.parent == NO_PARENT {
+                break;
+            }
+            current = entry.parent;
+        }
+        let mut parts = parts.into_iter().rev();
+        let mut path = PathBuf::from(os_from_bytes(parts.next().expect("root name")));
+        for part in parts {
+            path.push(os_from_bytes(part));
+        }
+        path
+    }
+}
 
 pub struct ScanJob {
     pub updates: Receiver<Vec<ScanEvent>>,
@@ -125,10 +224,11 @@ fn scan(
     }
     let mut allocated_files = HashMap::new();
     let mut next_id = 1;
-    let mut directories = vec![(0, root.to_path_buf(), fs.root_metadata().identity)];
+    let mut directories = PendingDirectories::default();
+    directories.push(NO_PARENT, 0, root.as_os_str(), fs.root_metadata().identity);
     let mut errors = false;
     let mut root_failed = false;
-    while let Some((parent, directory, identity)) = directories.pop() {
+    while let Some((handle, parent, directory, identity)) = directories.pop() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -138,7 +238,7 @@ fn scan(
                 errors = true;
                 root_failed |= parent == 0;
                 if !emit(ScanEvent::Issue {
-                    parent,
+                    parent: parent as usize,
                     issue: ScanIssue {
                         path: directory,
                         message: error.to_string(),
@@ -146,7 +246,7 @@ fn scan(
                 }) {
                     return;
                 }
-                if !emit(ScanEvent::DirectoryRead(parent)) {
+                if !emit(ScanEvent::DirectoryRead(parent as usize)) {
                     return;
                 }
                 continue;
@@ -166,18 +266,19 @@ fn scan(
                 break;
             }
             let observed = entry
-                .map_err(|error| (directory.clone(), error))
+                .map_err(|error| (directory.clone(), OsString::new(), error))
                 .and_then(|name| {
                     let path = directory.join(&name);
                     match entries.metadata(&name) {
-                        Ok(metadata) => Ok((path, metadata)),
-                        Err(error) => Err((path, error)),
+                        Ok(metadata) => Ok((path, name, metadata)),
+                        Err(error) => Err((path, name, error)),
                     }
                 });
             match observed {
-                Ok((path, metadata)) => {
+                Ok((path, name, metadata)) => {
                     let kind = metadata.kind;
-                    let hard_link_to = if kind == EntryKind::File {
+                    // Only multiply linked inodes can repeat inside one scan.
+                    let hard_link_to = if kind == EntryKind::File && metadata.links > 1 {
                         match allocated_files.entry(metadata.identity) {
                             Entry::Occupied(entry) => Some(*entry.get()),
                             Entry::Vacant(entry) => {
@@ -194,12 +295,12 @@ fn scan(
                         metadata.allocated_bytes
                     };
                     if kind == EntryKind::Directory {
-                        directories.push((next_id, path.clone(), metadata.identity));
+                        directories.push(handle, next_id as u32, &name, metadata.identity);
                     }
                     next_id += 1;
                     if !emit(ScanEvent::Entry {
                         path,
-                        parent: Some(parent),
+                        parent: Some(parent as usize),
                         kind,
                         bytes,
                         hard_link_to,
@@ -207,10 +308,10 @@ fn scan(
                         return;
                     }
                 }
-                Err((path, error)) => {
+                Err((path, _, error)) => {
                     errors = true;
                     if !emit(ScanEvent::Issue {
-                        parent,
+                        parent: parent as usize,
                         issue: ScanIssue {
                             path,
                             message: error.to_string(),
@@ -221,7 +322,7 @@ fn scan(
                 }
             }
         }
-        if !interrupted && !emit(ScanEvent::DirectoryRead(parent)) {
+        if !interrupted && !emit(ScanEvent::DirectoryRead(parent as usize)) {
             return;
         }
     }

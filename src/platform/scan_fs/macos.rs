@@ -148,6 +148,7 @@ fn metadata_from_stat(stat: Stat) -> io::Result<EntryMetadata> {
             device: stat.st_dev as u64,
             inode: stat.st_ino,
         },
+        links: stat.st_nlink as u64,
     })
 }
 

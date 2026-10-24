@@ -20,6 +20,9 @@ pub struct EntryMetadata {
     pub kind: EntryKind,
     pub allocated_bytes: u64,
     pub identity: FileIdentity,
+    /// Hard-link count from `st_nlink`. A file with a single link can never be
+    /// an alias, so the scanner keeps it out of the deduplication table.
+    pub links: u64,
 }
 
 pub trait DirectoryReader: Iterator<Item = io::Result<OsString>> {

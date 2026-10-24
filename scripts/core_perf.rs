@@ -1,6 +1,7 @@
 //! Synthetic in-memory performance check; does not measure filesystem I/O.
 //! Run: rustc --edition=2024 -O scripts/core_perf.rs -o /tmp/clean-core-perf
 //!      /tmp/clean-core-perf
+//!      /tmp/clean-core-perf --memory 3000000
 #![allow(dead_code)]
 
 #[path = "../src/analysis/mod.rs"]
@@ -18,7 +19,7 @@ use std::{
 };
 
 use analysis::{DirectoryIndex, LargeFileIndex};
-use models::{EntryKind, Node, ScanEvent, ScanResults, ScanState};
+use models::{EntryKind, ScanEvent, ScanResults, ScanState};
 
 fn measure(depth: usize, indexes: bool) {
     const FILES: usize = 100_000;
@@ -34,7 +35,6 @@ fn measure(depth: usize, indexes: bool) {
     let mut files = LargeFileIndex::default();
     let mut directory = DirectoryIndex::default();
     directory.select(&results, depth);
-    let mut visible = Vec::new();
     let started = Instant::now();
     for first in (0..FILES).step_by(BATCH) {
         let changes =
@@ -50,23 +50,24 @@ fn measure(depth: usize, indexes: bool) {
         if indexes {
             files.update(&results);
             directory.update(&results, &changes);
-            directory.write_sorted(&mut visible);
-            black_box(&visible);
+            directory.sync(&results);
+            black_box(directory.len());
         }
     }
     let elapsed = started.elapsed();
     assert_eq!(results.files, FILES);
     let expected: u64 = (0..FILES).map(|n| (n % 8192) as u64).sum();
-    assert_eq!(results.nodes[0].bytes, expected);
-    assert_eq!(results.nodes[depth].bytes, expected);
+    assert_eq!(results.bytes(0), expected);
+    assert_eq!(results.bytes(depth), expected);
     if indexes {
-        directory.write_sorted(&mut visible);
-        let sorted = &visible;
-        assert_eq!(sorted.len(), FILES);
-        assert!(sorted.windows(2).all(|pair| {
-            let a = &results.nodes[pair[0]];
-            let b = &results.nodes[pair[1]];
-            a.bytes > b.bytes || (a.bytes == b.bytes && a.path < b.path)
+        directory.sync(&results);
+        assert_eq!(directory.len(), FILES);
+        assert!((0..directory.len() - 1).all(|index| {
+            let a = directory.id(index);
+            let b = directory.id(index + 1);
+            results.bytes(a) > results.bytes(b)
+                || (results.bytes(a) == results.bytes(b)
+                    && results.name_suffix(a) < results.name_suffix(b))
         }));
     }
     println!("{FILES} files, depth={depth}, indexes={indexes}: {elapsed:?}");
@@ -119,18 +120,21 @@ fn report_memory(stage: &str, baseline: usize) {
     );
 }
 
+fn synthetic_size(id: usize) -> u64 {
+    // A long tail: most entries are small, roughly one in a thousand is large.
+    if id % 997 == 0 {
+        (((id % 4096) as u64) + 1) * 1024 * 1024
+    } else {
+        (((id % 97) as u64) + 1) * 512
+    }
+}
+
 fn measure_memory(count: usize) {
-    println!(
-        "{count} files; Node={} bytes; requested heap only, not RSS",
-        std::mem::size_of::<Node>()
-    );
+    println!("{count} files; requested heap only, not RSS");
     let prefix = PathBuf::from(format!("/root/{}", "d".repeat(100)));
     let baseline = LIVE_BYTES.load(Ordering::Relaxed);
     PEAK_BYTES.store(baseline, Ordering::Relaxed);
-    let mut results = ScanResults {
-        state: ScanState::Scanning,
-        ..Default::default()
-    };
+    let mut results = ScanResults::scanning();
     results.apply_batch([ScanEvent::Entry {
         path: prefix.clone(),
         parent: None,
@@ -141,24 +145,30 @@ fn measure_memory(count: usize) {
     let mut directory = DirectoryIndex::default();
     directory.select(&results, 0);
     let mut files = LargeFileIndex::default();
+    // Only multiply linked files need a deduplication table in the real
+    // scanner; model a small fraction of them here.
     let mut identities = HashMap::new();
-    let mut visible = Vec::new();
     for first in (0..count).step_by(128) {
         let changes = results.apply_batch((first..(first + 128).min(count)).map(|id| {
-            identities.insert((1_u64, id as u64), id + 1);
+            if id % 10_000 == 0 {
+                identities.insert((1_u64, id as u64), id + 1);
+            }
             ScanEvent::Entry {
                 path: prefix.join(format!("file-{id:09}")),
                 parent: Some(0),
                 kind: EntryKind::File,
-                bytes: (id as u64 + 1) * 4096,
+                bytes: synthetic_size(id),
                 hard_link_to: None,
             }
         }));
         directory.update(&results, &changes);
         files.update(&results);
+        if id_visible_refresh(first) {
+            directory.sync(&results);
+        }
     }
-    directory.write_sorted(&mut visible);
-    report_memory("scanning with dedup + two indexes + visible IDs", baseline);
+    directory.sync(&results);
+    report_memory("scanning with dedup + two indexes", baseline);
     drop(identities);
     let changes = results.apply_batch([
         ScanEvent::DirectoryRead(0),
@@ -166,17 +176,25 @@ fn measure_memory(count: usize) {
     ]);
     directory.update(&results, &changes);
     files.update(&results);
-    directory.write_sorted(&mut visible);
-    report_memory("finished with two indexes + visible IDs", baseline);
-    assert_eq!(visible.len(), count);
-    assert_eq!(visible.first().copied(), (count > 0).then_some(count));
-    files.write_matching(&results, 0, &mut visible);
-    assert_eq!(visible.len(), count);
-    assert_eq!(
-        results.nodes[0].bytes,
-        (1..=count as u64).sum::<u64>() * 4096
-    );
-    black_box((&results, &directory, &files, &visible));
+    directory.sync(&results);
+    report_memory("finished with two indexes", baseline);
+    assert_eq!(directory.len(), count);
+    let expected: u64 = (0..count).map(synthetic_size).sum();
+    assert_eq!(results.bytes(0), expected);
+    files.sync(&results, analysis::LARGE_FILE_FLOOR);
+    black_box((
+        &results,
+        &directory,
+        &files,
+        files.visible_len(&results, analysis::LARGE_FILE_FLOOR),
+    ));
+}
+
+/// The UI merges newly discovered children a few times per second, not once
+/// per batch. Refreshing less often keeps the pending buffer small while
+/// avoiding an O(n) merge for every 128 entries.
+fn id_visible_refresh(first: usize) -> bool {
+    first % (128 * 1024) == 0
 }
 
 fn main() {
