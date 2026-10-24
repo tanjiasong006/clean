@@ -277,3 +277,80 @@ fn hard_link_aliases_show_their_owner_instead_of_misleading_zero_bytes() {
     view.set_page(Page::LargeFiles);
     assert_eq!(visible(&view), vec![4, 2, 3]);
 }
+
+#[test]
+fn overview_lists_root_children_and_entering_switches_to_directory_page() {
+    let mut view = populated_view();
+    view.set_page(Page::Overview);
+    assert_eq!(visible(&view), vec![1, 2, 3]);
+    assert_eq!(view.overview_view.selected, None);
+    view.overview_view.selected = Some(1);
+    assert_eq!(view.selected(), Some(1));
+    view.navigate_to(1, true);
+    assert_eq!(view.page, Page::Directory);
+    assert_eq!(view.directory, 1);
+    assert_eq!(view.history, vec![0]);
+    assert_eq!(visible(&view), vec![4]);
+}
+
+#[test]
+fn keyboard_steps_clamp_and_start_from_the_visible_edges() {
+    let mut view = populated_view();
+    view.set_page(Page::Overview);
+    assert_eq!(view.select_step(1), Some(0));
+    assert_eq!(view.selected(), Some(view.visible_id(0)));
+    assert_eq!(view.select_step(-1), Some(0));
+    assert_eq!(view.select_step(1), Some(1));
+    assert_eq!(view.select_step(1), Some(2));
+    assert_eq!(view.select_step(1), Some(2));
+    assert_eq!(view.select_step(-1), Some(1));
+    view.clear_selection();
+    assert_eq!(view.select_step(-1), Some(2));
+    view.set_page(Page::LargeFiles);
+    view.large_file_view.selected = None;
+    assert_eq!(view.select_step(1), Some(0));
+    assert_eq!(view.visible_id(0), 4);
+}
+
+#[test]
+fn overview_and_directory_share_sizes_but_use_their_own_share_denominator() {
+    let mut view = populated_view();
+    view.set_page(Page::Overview);
+    assert_eq!(view.share_label(1), "91.1%");
+    assert_eq!(view.share_label(2), "8.9%");
+    view.navigate_to(1, false);
+    assert_eq!(view.share_label(4), "100.0%");
+    assert_eq!(view.share_label(1), "100.0%");
+}
+
+#[test]
+fn hard_link_aliases_never_claim_a_share_and_keep_their_owner_explanation() {
+    let mut view = populated_view();
+    view.apply_updates([crate::models::ScanEvent::Entry {
+        path: "/root/nested/alias".into(),
+        parent: Some(1),
+        kind: EntryKind::File,
+        bytes: 0,
+        hard_link_to: Some(2),
+    }]);
+    view.navigate_to(1, false);
+    assert_eq!(view.share_label(5), "已去重");
+    assert!(view.row_subtitle(5, true).contains("/root/top"));
+    assert!(view.explanation(5).contains("不重复统计"));
+}
+
+#[test]
+fn grouping_and_duration_labels_are_stable() {
+    assert_eq!(super::format_count(0), "0");
+    assert_eq!(super::format_count(999), "999");
+    assert_eq!(super::format_count(1_234), "1,234");
+    assert_eq!(super::format_count(1_234_567), "1,234,567");
+    assert_eq!(
+        super::duration_text(std::time::Duration::from_millis(1_250)),
+        "1.2 秒"
+    );
+    assert_eq!(
+        super::duration_text(std::time::Duration::from_secs(61)),
+        "1 分 01 秒"
+    );
+}

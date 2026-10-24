@@ -2,22 +2,37 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::PathBuf,
-    sync::mpsc::TryRecvError,
+    sync::{Arc, mpsc::TryRecvError},
     time::{Duration, Instant},
 };
 
-use gpui_kit::component::{ActiveTheme, Disableable, button::Button};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{
+    ActiveTheme, Disableable, Icon, Sizable, Size, StyledExt, Theme,
+    button::{Button, ButtonVariants},
+    h_flex,
+    menu::{ContextMenuExt, PopupMenuItem},
+    scroll::ScrollableElement,
+    spinner::Spinner,
+    v_flex,
+};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::{
-    analysis::{DirectoryIndex, LargeFileIndex, format_bytes},
+    analysis::{DirectoryIndex, LARGE_FILE_FLOOR, LargeFileIndex, format_bytes},
     models::{DiskSpace, EntryKind, NodeId, ScanEvent, ScanIssue, ScanResults, ScanState},
     platform,
     scanner::ScanJob,
 };
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+const ROW_HEIGHT: f32 = 44.0;
+const SMALL_ROW_HEIGHT: f32 = 30.0;
+const INSPECTOR_WIDTH: f32 = 300.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Page {
+    Overview,
     #[default]
     Directory,
     LargeFiles,
@@ -28,6 +43,23 @@ enum Page {
 struct DirectoryView {
     selected: Option<NodeId>,
     scroll: UniformListScrollHandle,
+}
+
+#[derive(Clone)]
+enum NavAction {
+    Page(Page),
+    Scan(PathBuf),
+    Choose,
+}
+
+struct NavEntry {
+    id: &'static str,
+    icon: IconName,
+    label: String,
+    active: bool,
+    disabled: bool,
+    badge: Option<usize>,
+    action: NavAction,
 }
 
 pub struct AppView {
@@ -43,6 +75,7 @@ pub struct AppView {
     last_refresh: Instant,
     visible_dirty: bool,
     large_file_view: DirectoryView,
+    overview_view: DirectoryView,
     minimum_bytes: u64,
     disk_space: Option<Result<DiskSpace, String>>,
     disk_task: Option<Task<()>>,
@@ -52,6 +85,11 @@ pub struct AppView {
     choosing: bool,
     notice: Option<String>,
     scan_root: Option<PathBuf>,
+    scan_started: Option<Instant>,
+    scan_elapsed: Option<Duration>,
+    last_clock: Instant,
+    show_inspector: bool,
+    focus_handle: Option<FocusHandle>,
 }
 
 impl Default for AppView {
@@ -69,6 +107,7 @@ impl Default for AppView {
             last_refresh: Instant::now(),
             visible_dirty: false,
             large_file_view: DirectoryView::default(),
+            overview_view: DirectoryView::default(),
             minimum_bytes: 100 * 1024 * 1024,
             disk_space: None,
             disk_task: None,
@@ -78,13 +117,21 @@ impl Default for AppView {
             choosing: false,
             notice: None,
             scan_root: None,
+            scan_started: None,
+            scan_elapsed: None,
+            last_clock: Instant::now(),
+            show_inspector: true,
+            focus_handle: None,
         }
     }
 }
 
 impl AppView {
-    pub fn new(_: &mut Context<Self>) -> Self {
-        Self::default()
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus_handle: Some(cx.focus_handle()),
+            ..Self::default()
+        }
     }
 
     fn start_scan(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -103,6 +150,8 @@ impl AppView {
         self.results = ScanResults::scanning();
         self.job = Some(job);
         self.scan_root = Some(path.clone());
+        self.scan_started = Some(Instant::now());
+        self.scan_elapsed = None;
         self.disk_space = None;
         self.disk_task = Some(cx.spawn(async move |this, cx| {
             let space = cx
@@ -124,7 +173,8 @@ impl AppView {
         self.large_files = LargeFileIndex::default();
         self.directory_index = DirectoryIndex::default();
         self.large_file_view = DirectoryView::default();
-        self.page = Page::Directory;
+        self.overview_view = DirectoryView::default();
+        self.page = Page::Overview;
         self.issue_scroll = UniformListScrollHandle::new();
         self.cancelling = false;
         self.notice = None;
@@ -216,9 +266,17 @@ impl AppView {
             cx.notify();
         }
         if self.results.state != ScanState::Scanning {
+            if let Some(started) = self.scan_started.take() {
+                self.scan_elapsed = Some(started.elapsed());
+            }
             self.job = None;
             self.cancelling = false;
             return false;
+        }
+        // Keep the elapsed clock legible without repainting every frame.
+        if self.last_clock.elapsed() >= Duration::from_millis(250) {
+            self.last_clock = Instant::now();
+            cx.notify();
         }
         true
     }
@@ -275,6 +333,11 @@ impl AppView {
         self.last_refresh = Instant::now();
         self.visible_dirty = false;
         match self.page {
+            Page::Overview => {
+                self.directory_index.select(&self.results, 0);
+                self.directory_index.sync(&self.results);
+                self.large_files.sync(&self.results, LARGE_FILE_FLOOR);
+            }
             Page::Directory => {
                 self.directory_index.select(&self.results, self.directory);
                 self.directory_index.sync(&self.results);
@@ -286,7 +349,7 @@ impl AppView {
 
     fn visible_len(&self) -> usize {
         match self.page {
-            Page::Directory => self.directory_index.len(),
+            Page::Overview | Page::Directory => self.directory_index.len(),
             Page::LargeFiles => self
                 .large_files
                 .visible_len(&self.results, self.minimum_bytes),
@@ -296,7 +359,7 @@ impl AppView {
 
     fn visible_id(&self, index: usize) -> NodeId {
         match self.page {
-            Page::Directory => self.directory_index.id(index),
+            Page::Overview | Page::Directory => self.directory_index.id(index),
             Page::LargeFiles => self.large_files.visible_id(self.minimum_bytes, index),
             Page::Issues => 0,
         }
@@ -321,25 +384,24 @@ impl AppView {
     }
 
     fn open_parent(&mut self) {
-        if self.page == Page::LargeFiles
-            && let Some(id) = self.selected()
-            && let Some(parent) = self.results.parent(id)
-        {
-            self.navigate_to(parent, true);
-            self.views.entry(parent).or_default().selected = Some(id);
-            if let Some(index) = (0..self.visible_len()).find(|index| self.visible_id(*index) == id)
-            {
-                self.views
-                    .entry(parent)
-                    .or_default()
-                    .scroll
-                    .scroll_to_item(index, ScrollStrategy::Center);
-            }
+        let Some(id) = self.selected() else { return };
+        let Some(parent) = self.results.parent(id) else {
+            return;
+        };
+        self.navigate_to(parent, true);
+        self.views.entry(parent).or_default().selected = Some(id);
+        if let Some(index) = (0..self.visible_len()).find(|index| self.visible_id(*index) == id) {
+            self.views
+                .entry(parent)
+                .or_default()
+                .scroll
+                .scroll_to_item(index, ScrollStrategy::Center);
         }
     }
 
     fn selected(&self) -> Option<NodeId> {
         match self.page {
+            Page::Overview => self.overview_view.selected,
             Page::Directory => self
                 .views
                 .get(&self.directory)
@@ -347,6 +409,156 @@ impl AppView {
             Page::LargeFiles => self.large_file_view.selected,
             Page::Issues => None,
         }
+    }
+
+    fn select_id(&mut self, id: NodeId) {
+        match self.page {
+            Page::Overview => self.overview_view.selected = Some(id),
+            Page::Directory => self.views.entry(self.directory).or_default().selected = Some(id),
+            Page::LargeFiles => self.large_file_view.selected = Some(id),
+            Page::Issues => {}
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        match self.page {
+            Page::Overview => self.overview_view.selected = None,
+            Page::Directory => self.views.entry(self.directory).or_default().selected = None,
+            Page::LargeFiles => self.large_file_view.selected = None,
+            Page::Issues => {}
+        }
+    }
+
+    fn current_scroll(&self) -> Option<UniformListScrollHandle> {
+        match self.page {
+            Page::Overview => Some(self.overview_view.scroll.clone()),
+            Page::Directory => Some(
+                self.views
+                    .get(&self.directory)
+                    .map(|view| view.scroll.clone())
+                    .unwrap_or_default(),
+            ),
+            Page::LargeFiles => Some(self.large_file_view.scroll.clone()),
+            Page::Issues => None,
+        }
+    }
+
+    fn focus_list(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = &self.focus_handle {
+            handle.focus(window, cx);
+        }
+    }
+
+    fn select_step(&mut self, delta: isize) -> Option<usize> {
+        let len = self.visible_len();
+        if len == 0 {
+            return None;
+        }
+        let current = self
+            .selected()
+            .and_then(|selected| (0..len).find(|index| self.visible_id(*index) == selected));
+        let next = match current {
+            Some(index) => (index as isize + delta).clamp(0, len as isize - 1) as usize,
+            None if delta >= 0 => 0,
+            None => len - 1,
+        };
+        let id = self.visible_id(next);
+        self.select_id(id);
+        Some(next)
+    }
+
+    fn step_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(next) = self.select_step(delta) {
+            if let Some(scroll) = self.current_scroll() {
+                scroll.scroll_to_item(next, ScrollStrategy::Center);
+            }
+            cx.notify();
+        }
+    }
+
+    fn enter_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selected() else { return };
+        if self.results.kind(id) == EntryKind::Directory {
+            self.navigate(id, true, cx);
+            return;
+        }
+        if self.page == Page::LargeFiles {
+            self.open_parent();
+            cx.notify();
+            return;
+        }
+        self.reveal_selected(cx);
+    }
+
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        if self.page != Page::Directory {
+            self.set_page(Page::Directory);
+            cx.notify();
+            return;
+        }
+        if let Some(id) = self.history.pop() {
+            self.navigate_to(id, false);
+            cx.notify();
+        }
+    }
+
+    fn go_up(&mut self, cx: &mut Context<Self>) {
+        if self.page == Page::LargeFiles {
+            self.open_parent();
+            cx.notify();
+            return;
+        }
+        if self.page != Page::Directory {
+            return;
+        }
+        let Some(parent) = self.results.parent(self.directory) else {
+            return;
+        };
+        self.navigate(parent, true, cx);
+    }
+
+    fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+
+        if modifiers.platform && !modifiers.shift && key == "c" {
+            self.copy_selected(cx);
+            return;
+        }
+        if modifiers.platform && !modifiers.shift && key == "i" {
+            self.show_inspector = !self.show_inspector;
+            cx.notify();
+            return;
+        }
+        if modifiers.platform && modifiers.shift && key == "r" {
+            self.reveal_selected(cx);
+            return;
+        }
+        if modifiers.platform && !modifiers.shift && key == "up" {
+            self.go_up(cx);
+            return;
+        }
+        if modifiers.modified() {
+            return;
+        }
+
+        match key {
+            "up" => self.step_selection(-1, cx),
+            "down" => self.step_selection(1, cx),
+            "enter" => self.enter_selected(cx),
+            "backspace" => self.go_back(cx),
+            "escape" => {
+                self.clear_selection();
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn copy_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selected() else { return };
+        let path = self.results.to_path_buf(id);
+        cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
     }
 
     fn reveal_selected(&mut self, cx: &mut Context<Self>) {
@@ -374,6 +586,53 @@ impl AppView {
         cx.notify();
     }
 
+    fn denominator(&self) -> NodeId {
+        match self.page {
+            Page::Directory => self.directory,
+            _ => 0,
+        }
+    }
+
+    fn share(&self, id: NodeId) -> Option<f32> {
+        if self.page == Page::Issues || self.results.is_empty() {
+            return None;
+        }
+        if self.results.hard_link_to(id).is_some() {
+            return None;
+        }
+        let denominator = self.denominator();
+        if denominator >= self.results.len() || self.results.size_overflow(denominator) {
+            return None;
+        }
+        let total = self.results.bytes(denominator);
+        if total == 0 {
+            return None;
+        }
+        if id == denominator {
+            return Some(1.0);
+        }
+        Some((self.results.bytes(id) as f64 / total as f64) as f32)
+    }
+
+    fn share_label(&self, id: NodeId) -> String {
+        match self.share(id) {
+            Some(ratio) if ratio > 0.0 && ratio < 0.001 => "<0.1%".into(),
+            Some(ratio) => format!("{:.1}%", ratio * 100.0),
+            None if self.results.hard_link_to(id).is_some() => "已去重".into(),
+            None => "—".into(),
+        }
+    }
+
+    fn share_caption(&self) -> &'static str {
+        match self.page {
+            Page::Directory => "占当前目录",
+            Page::LargeFiles => "占扫描总量",
+            Page::Overview => "占扫描总量",
+            Page::Issues => "占比",
+        }
+    }
+
+    #[cfg(test)]
     fn entry_description(&self, id: NodeId) -> String {
         if let Some(owner) = self.results.hard_link_to(id) {
             return format!("硬链接 · 已计入 {}", self.results.path(owner).display());
@@ -404,211 +663,1098 @@ impl AppView {
         }
     }
 
-    fn render_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let id = self.visible_id(index);
-        let selected = self.selected() == Some(id);
-        let large_file = self.page == Page::LargeFiles;
-        let kind = self.results.kind(id);
-        let is_directory = kind == EntryKind::Directory;
-        let prefix = match kind {
-            EntryKind::Directory => "▸",
-            EntryKind::File => "·",
-            EntryKind::Symlink => "↗",
-            EntryKind::Other => "–",
+    fn row_subtitle(&self, id: NodeId, wide: bool) -> String {
+        if let Some(owner) = self.results.hard_link_to(id) {
+            return format!("硬链接 · 已计入 {}", self.results.path(owner).display());
+        }
+        if self.page == Page::LargeFiles {
+            return self
+                .results
+                .parent(id)
+                .map(|parent| self.results.path(parent).display().to_string())
+                .unwrap_or_default();
+        }
+        match self.results.kind(id) {
+            EntryKind::Directory => {
+                if self.results.size_overflow(id) {
+                    return "目录 · 已分配空间超出统计范围".into();
+                }
+                if self.results.errors(id) > 0 {
+                    return format!(
+                        "目录 · {} 项读取失败",
+                        format_count(self.results.errors(id))
+                    );
+                }
+                if !self.results.is_complete(id) {
+                    return if self.results.state == ScanState::Scanning {
+                        "目录 · 正在扫描".into()
+                    } else {
+                        "目录 · 尚未扫描完整".into()
+                    };
+                }
+                if self.results.child_count(id) == 0 {
+                    return "空目录".into();
+                }
+                if wide {
+                    "目录".into()
+                } else {
+                    format!(
+                        "目录 · {} 个直接子项",
+                        format_count(self.results.child_count(id))
+                    )
+                }
+            }
+            EntryKind::File => "文件".into(),
+            EntryKind::Symlink => "符号链接 · 未计入".into(),
+            EntryKind::Other => "特殊文件 · 未计入".into(),
+        }
+    }
+
+    fn kind_label(&self, id: NodeId) -> &'static str {
+        match self.results.kind(id) {
+            EntryKind::Directory => "目录",
+            EntryKind::File if self.results.hard_link_to(id).is_some() => "文件（硬链接别名）",
+            EntryKind::File => "文件",
+            EntryKind::Symlink => "符号链接",
+            EntryKind::Other => "特殊文件",
+        }
+    }
+
+    fn entry_icon(&self, id: NodeId, cx: &App) -> Icon {
+        let size = px(15.0);
+        let color = match self.results.kind(id) {
+            EntryKind::Directory => cx.theme().chart_2,
+            _ => cx.theme().muted_foreground,
         };
-        let name = self.results.name(id).to_string_lossy().into_owned();
-        let description = self.entry_description(id);
-        let denominator = if large_file { 0 } else { self.directory };
-        let total = self.results.bytes(denominator);
-        let ratio = if total == 0 {
-            0.0
+        let name = match self.results.kind(id) {
+            EntryKind::Directory => IconName::Folder,
+            EntryKind::File => IconName::File,
+            EntryKind::Symlink => IconName::Link2,
+            EntryKind::Other => IconName::FileQuestionMark,
+        };
+        Icon::new(name).with_size(size).text_color(color)
+    }
+
+    fn root_label(&self) -> String {
+        let Some(root) = &self.scan_root else {
+            return "尚未选择扫描位置".into();
+        };
+        if platform::home_directory().as_deref() == Some(root.as_path()) {
+            return "主目录".into();
+        }
+        root.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.display().to_string())
+    }
+
+    fn elapsed_label(&self) -> Option<String> {
+        let duration = match self.scan_started {
+            Some(started) => started.elapsed(),
+            None => self.scan_elapsed?,
+        };
+        Some(duration_text(duration))
+    }
+
+    fn state_label(&self) -> &'static str {
+        if self.cancelling {
+            return "正在停止";
+        }
+        match self.results.state {
+            ScanState::Idle => "未开始",
+            ScanState::Scanning => "扫描中",
+            ScanState::Partial => "不完整",
+            ScanState::Complete => "已完成",
+            ScanState::Failed => "失败",
+        }
+    }
+
+    fn state_color(&self, cx: &App) -> Hsla {
+        match self.results.state {
+            ScanState::Scanning => cx.theme().chart_2,
+            ScanState::Partial => cx.theme().yellow,
+            ScanState::Failed => cx.theme().red,
+            _ => cx.theme().muted_foreground,
+        }
+    }
+
+    fn sidebar_entries(&self) -> Vec<NavEntry> {
+        let has_scan = self.scan_root.is_some();
+        let scanning = self.results.state == ScanState::Scanning;
+        let home = platform::home_directory();
+        let downloads = home.as_ref().map(|home| home.join("Downloads"));
+        let scanning_home = home.is_some() && self.scan_root == home;
+        let scanning_downloads = downloads.is_some() && self.scan_root == downloads;
+        let mut entries = vec![
+            NavEntry {
+                id: "nav-overview",
+                icon: IconName::LayoutDashboard,
+                label: "概览".into(),
+                active: self.page == Page::Overview,
+                disabled: !has_scan,
+                badge: None,
+                action: NavAction::Page(Page::Overview),
+            },
+            NavEntry {
+                id: "nav-directory",
+                icon: IconName::FolderTree,
+                label: "目录".into(),
+                active: self.page == Page::Directory,
+                disabled: !has_scan,
+                badge: None,
+                action: NavAction::Page(Page::Directory),
+            },
+            NavEntry {
+                id: "nav-large-files",
+                icon: IconName::Files,
+                label: "大文件".into(),
+                active: self.page == Page::LargeFiles,
+                disabled: !has_scan,
+                badge: None,
+                action: NavAction::Page(Page::LargeFiles),
+            },
+            NavEntry {
+                id: "nav-issues",
+                icon: IconName::TriangleAlert,
+                label: "扫描问题".into(),
+                active: self.page == Page::Issues,
+                disabled: !has_scan,
+                badge: (!self.results.issues.is_empty()).then_some(self.results.issues.len()),
+                action: NavAction::Page(Page::Issues),
+            },
+        ];
+
+        if let Some(home) = home {
+            entries.push(NavEntry {
+                id: "scan-home",
+                icon: IconName::House,
+                label: "主目录".into(),
+                active: scanning_home && scanning,
+                disabled: scanning,
+                badge: None,
+                action: NavAction::Scan(home),
+            });
+        }
+        if let Some(downloads) = downloads {
+            entries.push(NavEntry {
+                id: "scan-downloads",
+                icon: IconName::Download,
+                label: "下载".into(),
+                active: scanning_downloads && scanning,
+                disabled: scanning,
+                badge: None,
+                action: NavAction::Scan(downloads),
+            });
+        }
+        entries.push(NavEntry {
+            id: "scan-choose",
+            icon: IconName::FolderOpen,
+            label: "选择目录…".into(),
+            active: false,
+            disabled: scanning || self.choosing,
+            badge: None,
+            action: NavAction::Choose,
+        });
+        entries
+    }
+
+    fn render_sidebar_entry(&self, entry: NavEntry, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let active = entry.active;
+        let disabled = entry.disabled;
+        let badge = entry.badge;
+        let action = entry.action.clone();
+        let text_color = if disabled {
+            theme.muted_foreground.opacity(0.5)
+        } else if active {
+            theme.sidebar_accent_foreground
         } else {
-            self.results.bytes(id) as f32 / total as f32
+            theme.sidebar_foreground
         };
+
         div()
-            .id(id)
+            .id(entry.id)
             .w_full()
-            .h(px(64.0))
-            .px_4()
+            .h(px(28.0))
+            .px_2()
+            .rounded(px(6.0))
             .flex()
             .items_center()
-            .gap_3()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(if selected {
-                cx.theme().secondary
+            .gap_2()
+            .bg(if active {
+                theme.sidebar_accent
             } else {
-                cx.theme().background
+                theme.transparent
             })
-            .hover(|style| style.bg(cx.theme().secondary))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                if large_file {
-                    this.large_file_view.selected = Some(id);
-                } else {
-                    this.views.entry(this.directory).or_default().selected = Some(id);
-                }
-                if is_directory && event.click_count() == 2 {
-                    this.navigate(id, true, cx);
-                }
-                cx.notify();
+            .text_size(px(12.5))
+            .text_color(text_color)
+            .aria_label(entry.label.clone())
+            .when(!disabled, |this| {
+                let action = action.clone();
+                this.cursor_pointer()
+                    .hover(|style| style.bg(theme.sidebar_accent))
+                    .on_click(cx.listener(move |this, _, _, cx| match &action {
+                        NavAction::Page(page) => this.show_page(*page, cx),
+                        NavAction::Scan(path) => this.start_scan(path.clone(), cx),
+                        NavAction::Choose => this.choose_directory(cx),
+                    }))
+            })
+            .child(div().w(px(2.0)).h(px(13.0)).rounded_full().bg(if active {
+                theme.chart_2
+            } else {
+                theme.transparent
             }))
-            .child(div().w_5().child(prefix))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().truncate().child(name))
-                    .child(
-                        div()
-                            .text_xs()
-                            .truncate()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(description),
-                    ),
+                Icon::new(entry.icon)
+                    .with_size(px(14.0))
+                    .text_color(if disabled {
+                        theme.muted_foreground.opacity(0.5)
+                    } else if active {
+                        theme.sidebar_accent_foreground
+                    } else {
+                        theme.muted_foreground
+                    }),
             )
-            .child(if self.results.size_overflow(denominator) {
+            .child(div().flex_1().min_w_0().truncate().child(entry.label))
+            .children(badge.map(|count| {
                 div()
-                    .w(px(110.0))
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("占比未知")
-                    .into_any_element()
-            } else {
-                div()
-                    .w(px(110.0))
-                    .h(px(5.0))
+                    .h(px(16.0))
+                    .px_1()
                     .rounded_full()
-                    .bg(cx.theme().secondary)
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(ratio))
-                            .rounded_full()
-                            .bg(cx.theme().primary),
-                    )
-                    .into_any_element()
-            })
-            .child(div().w(px(100.0)).text_right().child(self.entry_size(id)))
+                    .bg(theme.muted)
+                    .text_size(px(10.0))
+                    .text_color(theme.muted_foreground)
+                    .child(format_count(count))
+            }))
             .into_any_element()
     }
-}
 
-impl Render for AppView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = self.job.is_some() || self.choosing;
-        let home = platform::home_directory();
-        let has_home = home.is_some();
-        let downloads = home.as_ref().map(|home| home.join("Downloads"));
-        let root_path = self
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let entries = self.sidebar_entries();
+        let (analysis, scans): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| matches!(entry.action, NavAction::Page(_)));
+
+        v_flex()
+            .w(px(216.0))
+            .h_full()
+            .flex_shrink_0()
+            .bg(theme.sidebar)
+            .text_color(theme.sidebar_foreground)
+            .border_r_1()
+            .border_color(theme.sidebar_border)
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_4()
+                    .pb_3()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(28.0))
+                            .rounded(px(7.0))
+                            .bg(theme.primary)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(IconName::HardDrive)
+                                    .with_size(px(16.0))
+                                    .text_color(theme.primary_foreground),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_0()
+                            .child(div().text_size(px(14.0)).font_semibold().child("Clean"))
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child("磁盘空间分析"),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .px_2()
+                    .gap_1()
+                    .child(section_label("分析", theme.muted_foreground))
+                    .children(
+                        analysis
+                            .into_iter()
+                            .map(|entry| self.render_sidebar_entry(entry, cx)),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .px_2()
+                    .pt_4()
+                    .gap_1()
+                    .child(section_label("扫描位置", theme.muted_foreground))
+                    .children(
+                        scans
+                            .into_iter()
+                            .map(|entry| self.render_sidebar_entry(entry, cx)),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(
+                v_flex()
+                    .px_3()
+                    .py_3()
+                    .gap_1()
+                    .border_t_1()
+                    .border_color(theme.sidebar_border)
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.sidebar_foreground)
+                            .truncate()
+                            .child(self.root_label()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .child("只读分析 · 不修改文件"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_topbar(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let scanning = self.results.state == ScanState::Scanning;
+        let root = self
             .scan_root
             .as_ref()
-            .map(|path| path.display().to_string());
-        let allocated_size = if self.results.is_empty() {
-            format_bytes(0)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "选择位置开始分析".into());
+
+        let action = if scanning {
+            Button::new("stop-scan")
+                .with_size(Size::Small)
+                .label(if self.cancelling {
+                    "正在停止…"
+                } else {
+                    "停止扫描"
+                })
+                .icon(IconName::Square)
+                .disabled(self.cancelling)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(job) = &this.job {
+                        job.cancel();
+                        this.cancelling = true;
+                        cx.notify();
+                    }
+                }))
+                .into_any_element()
+        } else {
+            let root_path = self.scan_root.clone();
+            Button::new("rescan")
+                .with_size(Size::Small)
+                .label("重新扫描")
+                .icon(IconName::RotateCw)
+                .disabled(root_path.is_none() || self.choosing)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(path) = &root_path {
+                        if let Some(job) = &this.job {
+                            job.cancel();
+                        }
+                        let path = path.clone();
+                        this.start_scan(path, cx);
+                    }
+                }))
+                .into_any_element()
+        };
+
+        h_flex()
+            .h(px(52.0))
+            .px_4()
+            .gap_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                Icon::new(IconName::HardDrive)
+                    .with_size(px(16.0))
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .child("扫描位置"),
+                    )
+                    .child(div().text_size(px(12.5)).truncate().child(root)),
+            )
+            .when(!compact, |this| {
+                this.child(
+                    Button::new("choose-directory")
+                        .with_size(Size::Small)
+                        .label("选择目录…")
+                        .icon(IconName::FolderOpen)
+                        .ghost()
+                        .disabled(scanning || self.choosing)
+                        .on_click(cx.listener(|this, _, _, cx| this.choose_directory(cx))),
+                )
+            })
+            .child(action)
+            .when(self.page != Page::Issues, |this| {
+                this.child(
+                    Button::new("toggle-inspector")
+                        .with_size(Size::Small)
+                        .icon(IconName::Info)
+                        .ghost()
+                        .tooltip(if self.show_inspector {
+                            "隐藏详情"
+                        } else {
+                            "显示详情"
+                        })
+                        .toggled(self.show_inspector)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_inspector = !this.show_inspector;
+                            cx.notify();
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_summary(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let total = if self.results.is_empty() {
+            "0 B".to_string()
         } else if self.results.root_overflow() {
-            "已分配空间超出统计范围".into()
+            "超出统计范围".to_string()
         } else {
             format_bytes(self.results.root_bytes())
         };
-        let has_current = !self.results.is_empty() && self.directory < self.results.len();
+        let scanning = self.results.state == ScanState::Scanning;
+        let state_color = self.state_color(cx);
+
+        let volume = if compact {
+            None
+        } else {
+            Some(match &self.disk_space {
+                Some(Ok(space)) => {
+                    let used = space.capacity.saturating_sub(space.available);
+                    let ratio = if space.capacity == 0 {
+                        0.0
+                    } else {
+                        (used as f64 / space.capacity as f64) as f32
+                    };
+                    v_flex()
+                        .w(px(228.0))
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .text_size(px(10.0))
+                                .text_color(theme.muted_foreground)
+                                .child("所选卷")
+                                .child(format!(
+                                    "可用 {} / {}",
+                                    format_bytes(space.available),
+                                    format_bytes(space.capacity)
+                                )),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(4.0))
+                                .rounded_full()
+                                .bg(theme.muted)
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(ratio.clamp(0.0, 1.0)))
+                                        .rounded_full()
+                                        .bg(theme.muted_foreground.opacity(0.55)),
+                                ),
+                        )
+                        .into_any_element()
+                }
+                Some(Err(error)) => div()
+                    .w(px(228.0))
+                    .text_size(px(10.0))
+                    .text_color(theme.muted_foreground)
+                    .child(format!("无法读取所选卷容量：{error}"))
+                    .into_any_element(),
+                None => div()
+                    .w(px(228.0))
+                    .text_size(px(10.0))
+                    .text_color(theme.muted_foreground)
+                    .child("正在查询所选卷容量…")
+                    .into_any_element(),
+            })
+        };
+
+        v_flex()
+            .px_4()
+            .py_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                h_flex()
+                    .gap_5()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .min_w(px(150.0))
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child("已分配空间"),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_baseline()
+                                    .child(
+                                        div()
+                                            .text_size(px(24.0))
+                                            .font_semibold()
+                                            .font_features(tabular_numbers())
+                                            .child(total),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .id("scan-state")
+                                            .gap_1()
+                                            .items_center()
+                                            .aria_label(self.results.state.label())
+                                            .child(if scanning {
+                                                Spinner::new()
+                                                    .with_size(px(10.0))
+                                                    .color(state_color)
+                                                    .into_any_element()
+                                            } else {
+                                                div()
+                                                    .size(px(6.0))
+                                                    .rounded_full()
+                                                    .bg(state_color)
+                                                    .into_any_element()
+                                            })
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(self.state_label()),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(metric("文件", format_count(self.results.files), &theme))
+                    .child(metric(
+                        "目录",
+                        format_count(self.results.directories),
+                        &theme,
+                    ))
+                    .when(!compact, |this| {
+                        this.child(metric(
+                            "硬链接别名",
+                            format_count(self.results.hard_links),
+                            &theme,
+                        ))
+                    })
+                    .when(!compact, |this| {
+                        this.child(metric(
+                            "用时",
+                            self.elapsed_label().unwrap_or_else(|| "—".into()),
+                            &theme,
+                        ))
+                    })
+                    .child(div().flex_1())
+                    .children(volume),
+            )
+            .children(self.capacity_notice().map(|notice| {
+                h_flex()
+                    .gap_2()
+                    .text_size(px(10.5))
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        Icon::new(IconName::TriangleAlert)
+                            .with_size(px(12.0))
+                            .text_color(theme.yellow),
+                    )
+                    .child(notice)
+            }))
+            .children(self.notice.clone().map(|notice| {
+                h_flex()
+                    .gap_2()
+                    .text_size(px(10.5))
+                    .text_color(theme.red)
+                    .child(
+                        Icon::new(IconName::CircleAlert)
+                            .with_size(px(12.0))
+                            .text_color(theme.red),
+                    )
+                    .child(notice)
+            }))
+            .into_any_element()
+    }
+
+    fn render_breadcrumbs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
         let mut ancestors = Vec::new();
-        let mut ancestor = has_current.then_some(self.directory);
+        let mut ancestor = (self.directory < self.results.len()).then_some(self.directory);
         while let Some(id) = ancestor {
             ancestors.push(id);
             ancestor = self.results.parent(id);
         }
         ancestors.reverse();
-        let selected = self.selected();
-        let selected_path = selected.map(|id| self.results.to_path_buf(id));
-        let content = if self.page == Page::Issues && self.results.issues.is_empty() {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child("当前没有扫描问题。")
-                .into_any_element()
-        } else if self.page == Page::Issues {
-            div()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    uniform_list(
-                        "issues",
-                        self.results.issues.len(),
-                        cx.processor(|this, range: Range<usize>, _, cx| {
-                            range
-                                .map(|index| {
-                                    let issue = &this.results.issues[index];
-                                    div()
-                                        .w_full()
-                                        .h(px(76.0))
-                                        .px_4()
-                                        .py_2()
-                                        .border_b_1()
-                                        .border_color(cx.theme().border)
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .child(issue.path.display().to_string()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .truncate()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(issue.message.clone()),
-                                        )
-                                })
-                                .collect()
-                        }),
-                    )
-                    .size_full()
-                    .track_scroll(&self.issue_scroll),
-                )
-                .into_any_element()
-        } else if self.visible_len() == 0 {
-            let message = match self.results.state {
-                ScanState::Idle => "选择主目录、下载目录或其他目录开始分析。",
-                ScanState::Scanning => "正在发现目录内容…",
-                ScanState::Failed => "无法完成扫描，请查看扫描问题。",
-                ScanState::Partial if self.results.is_empty() => "扫描已取消，尚未发现目录内容。",
-                _ if self.page == Page::LargeFiles => "已发现的文件中没有符合当前大小条件的条目。",
-                _ if has_current && !self.results.is_complete(self.directory) => {
-                    "该目录未扫描完整，不能视为空目录。"
-                }
-                _ => "此目录为空。",
-            };
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(message)
-                .into_any_element()
-        } else {
-            let scroll = if self.page == Page::LargeFiles {
-                self.large_file_view.scroll.clone()
+
+        let mut crumbs = Vec::new();
+        for (index, id) in ancestors.into_iter().enumerate() {
+            if index > 0 {
+                crumbs.push(
+                    Icon::new(IconName::ChevronRight)
+                        .with_size(px(10.0))
+                        .text_color(theme.muted_foreground.opacity(0.7))
+                        .into_any_element(),
+                );
+            }
+            let label = if id == 0 {
+                self.root_label()
             } else {
-                self.views.entry(self.directory).or_default().scroll.clone()
+                self.results.name(id).to_string_lossy().into_owned()
             };
+            let active = id == self.directory;
+            crumbs.push(
+                div()
+                    .id(ElementId::named_usize("crumb", id))
+                    .px_1()
+                    .py_1()
+                    .rounded(px(4.0))
+                    .text_size(px(12.0))
+                    .text_color(if active {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .when(!active, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(theme.accent))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.navigate(id, true, cx)),
+                            )
+                    })
+                    .child(label)
+                    .into_any_element(),
+            );
+        }
+
+        h_flex()
+            .id("breadcrumbs")
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            .overflow_x_scroll()
+            .children(crumbs)
+            .into_any_element()
+    }
+
+    fn render_content_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        h_flex()
+            .h(px(40.0))
+            .px_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                Button::new("back")
+                    .with_size(Size::Small)
+                    .icon(IconName::ChevronLeft)
+                    .ghost()
+                    .tooltip("返回 (⌫)")
+                    .disabled(self.history.is_empty())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(id) = this.history.pop() {
+                            this.navigate_to(id, false);
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(self.render_breadcrumbs(cx))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.muted_foreground)
+                    .child("按大小 ↓"),
+            )
+            .child(
+                Button::new("reveal-toolbar")
+                    .with_size(Size::Small)
+                    .icon(IconName::FolderSearch)
+                    .ghost()
+                    .tooltip("在 Finder 中显示所选项目")
+                    .disabled(self.selected().is_none() || self.revealing)
+                    .on_click(cx.listener(|this, _, _, cx| this.reveal_selected(cx))),
+            )
+            .into_any_element()
+    }
+
+    fn render_table_header(&self, wide: bool, show_children: bool, cx: &App) -> AnyElement {
+        let theme = cx.theme().clone();
+        h_flex()
+            .h(px(28.0))
+            .px_3()
+            .gap_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .text_size(px(10.0))
+            .text_color(theme.muted_foreground)
+            .child(div().flex_1().min_w_0().pl(px(25.0)).child("名称"))
+            .when(wide && show_children, |this| {
+                this.child(div().w(px(88.0)).child("直接子项"))
+            })
+            .child(div().w(px(158.0)).child("占比"))
+            .child(div().w(px(92.0)).text_right().child("大小"))
+            .into_any_element()
+    }
+
+    fn render_row(&self, index: usize, wide: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let id = self.visible_id(index);
+        let selected = self.selected() == Some(id);
+        let kind = self.results.kind(id);
+        let is_directory = kind == EntryKind::Directory;
+        let name = self.results.name(id).to_string_lossy().into_owned();
+        let subtitle = self.row_subtitle(id, wide);
+        let share = self.share(id);
+        let bar_color = match kind {
+            EntryKind::Directory => theme.chart_2,
+            EntryKind::File => theme.muted_foreground.opacity(0.55),
+            _ => theme.muted_foreground.opacity(0.35),
+        };
+        let entity = cx.entity().downgrade();
+        let path = self.results.to_path_buf(id);
+        let page = self.page;
+
+        let row = div()
+            .id(ElementId::named_usize(
+                if self.page == Page::Overview {
+                    "overview-row"
+                } else {
+                    "row"
+                },
+                id,
+            ))
+            .relative()
+            .w_full()
+            .h(px(ROW_HEIGHT))
+            .px_3()
+            .gap_3()
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(theme.border.opacity(0.55))
+            .bg(if selected {
+                theme.list_active
+            } else {
+                theme.transparent
+            })
+            .when(!selected, |this| {
+                this.hover(|style| style.bg(theme.list_hover))
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.focus_list(window, cx);
+                this.select_id(id);
+                if is_directory && event.click_count() == 2 {
+                    this.navigate(id, true, cx);
+                } else if page == Page::LargeFiles && event.click_count() == 2 {
+                    this.open_parent();
+                }
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, window, cx| {
+                    this.focus_list(window, cx);
+                    this.select_id(id);
+                    cx.notify();
+                }),
+            )
+            .children(selected.then(|| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.0))
+                    .bg(theme.list_active_border)
+            }))
+            .child(self.entry_icon(id, cx))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0()
+                    .child(div().text_size(px(12.5)).truncate().child(name))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .truncate()
+                            .child(subtitle),
+                    ),
+            )
+            .when(wide && page != Page::LargeFiles, |this| {
+                this.child(
+                    div()
+                        .w(px(88.0))
+                        .text_size(px(10.5))
+                        .text_color(theme.muted_foreground)
+                        .font_features(tabular_numbers())
+                        .child(self.child_count_label(id)),
+                )
+            })
+            .child(
+                h_flex()
+                    .w(px(158.0))
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(theme.muted)
+                            .child(match share {
+                                Some(ratio) => div()
+                                    .h_full()
+                                    .w(relative(ratio.clamp(0.0, 1.0)))
+                                    .rounded_full()
+                                    .bg(bar_color)
+                                    .into_any_element(),
+                                None => div().h_full().w(px(0.0)).into_any_element(),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w(px(48.0))
+                            .text_right()
+                            .text_size(px(10.5))
+                            .text_color(theme.muted_foreground)
+                            .font_features(tabular_numbers())
+                            .child(self.share_label(id)),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(92.0))
+                    .text_right()
+                    .text_size(px(12.0))
+                    .font_features(tabular_numbers())
+                    .child(self.entry_size(id)),
+            );
+
+        row.context_menu(move |menu, _, _| {
+            let mut menu = menu;
+            if is_directory && page != Page::Issues {
+                let entity = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::new("进入目录")
+                        .icon(IconName::FolderOpen)
+                        .on_click(move |_, _, cx| {
+                            let _ = entity.update(cx, |this, cx| {
+                                this.navigate(id, true, cx);
+                            });
+                        }),
+                );
+            }
+            let reveal = entity.clone();
+            let reveal_path = path.clone();
+            menu = menu.item(
+                PopupMenuItem::new("在 Finder 中显示")
+                    .icon(IconName::FolderSearch)
+                    .on_click(move |_, _, cx| {
+                        let path = reveal_path.clone();
+                        let _ = reveal.update(cx, |this, cx| {
+                            this.find_in_finder(path, cx);
+                        });
+                    }),
+            );
+            let copy_path = path.clone();
+            menu = menu.item(
+                PopupMenuItem::new("复制路径")
+                    .icon(IconName::Copy)
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            copy_path.display().to_string(),
+                        ));
+                    }),
+            );
+            if page == Page::LargeFiles {
+                let entity = entity.clone();
+                menu = menu.separator().item(
+                    PopupMenuItem::new("前往所在目录")
+                        .icon(IconName::CornerDownRight)
+                        .on_click(move |_, _, cx| {
+                            let _ = entity.update(cx, |this, cx| {
+                                this.open_parent();
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            menu
+        })
+        .into_any_element()
+    }
+
+    fn child_count_label(&self, id: NodeId) -> String {
+        match self.results.kind(id) {
+            EntryKind::Directory => format_count(self.results.child_count(id)),
+            _ => String::new(),
+        }
+    }
+
+    fn find_in_finder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.revealing {
+            return;
+        }
+        self.revealing = true;
+        self.notice = None;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { platform::reveal_in_finder(&path) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.revealing = false;
+                if let Err(error) = result {
+                    this.notice = Some(format!("无法在 Finder 中定位：{error}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn render_empty_state(
+        &self,
+        title: &str,
+        detail: &str,
+        icon: IconName,
+        scanning: bool,
+        cx: &App,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_8()
+            .child(if scanning {
+                Spinner::new()
+                    .with_size(px(18.0))
+                    .color(theme.chart_2)
+                    .into_any_element()
+            } else {
+                Icon::new(icon)
+                    .with_size(px(22.0))
+                    .text_color(theme.muted_foreground)
+                    .into_any_element()
+            })
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_medium()
+                    .child(title.to_string()),
+            )
+            .child(
+                div()
+                    .max_w(px(420.0))
+                    .text_center()
+                    .text_size(px(11.0))
+                    .text_color(theme.muted_foreground)
+                    .child(detail.to_string()),
+            )
+            .into_any_element()
+    }
+
+    fn directory_empty_state(&self, cx: &App) -> AnyElement {
+        let scanning = self.results.state == ScanState::Scanning;
+        if scanning && self.results.is_empty() {
+            return self.render_empty_state(
+                "正在发现目录内容",
+                "目录较多时可能需要一些时间；结果会持续出现。",
+                IconName::Folder,
+                true,
+                cx,
+            );
+        }
+        if self.results.state == ScanState::Failed && self.results.is_empty() {
+            return self.render_empty_state(
+                "扫描失败",
+                "根目录无法读取。请查看扫描问题，或选择其他位置。",
+                IconName::TriangleAlert,
+                false,
+                cx,
+            );
+        }
+        let (title, detail) = if self.results.state == ScanState::Partial && self.results.is_empty()
+        {
+            ("扫描已停止", "尚未发现任何条目。重新扫描后会显示结果。")
+        } else if self.directory < self.results.len() && !self.results.is_complete(self.directory) {
+            if scanning {
+                ("正在扫描此目录", "该目录尚未扫描完整，暂不视为空目录。")
+            } else {
+                (
+                    "该目录尚未扫描完整",
+                    "部分内容未被读取，因此不能视为空目录。",
+                )
+            }
+        } else if self.results.state == ScanState::Idle {
+            ("尚未开始扫描", "选择一个位置后开始分析。")
+        } else {
+            ("此目录没有条目", "这里没有文件或子目录。")
+        };
+        self.render_empty_state(title, detail, IconName::Folder, scanning, cx)
+    }
+
+    fn render_directory_body(&self, wide: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let content = if self.visible_len() == 0 {
+            self.directory_empty_state(cx)
+        } else {
+            let scroll = self
+                .views
+                .get(&self.directory)
+                .map(|view| view.scroll.clone())
+                .unwrap_or_default();
             div()
+                .id("directory-list")
                 .flex_1()
                 .min_h_0()
+                .when_some(self.focus_handle.clone(), |this, handle| {
+                    this.track_focus(&handle).on_key_down(cx.listener(
+                        |this, event: &KeyDownEvent, _, cx| {
+                            this.handle_key(event, cx);
+                        },
+                    ))
+                })
                 .child(
                     uniform_list(
-                        (
-                            "entries",
-                            if self.page == Page::LargeFiles {
-                                usize::MAX
-                            } else {
-                                self.directory
-                            },
-                        ),
+                        ("entries", self.directory),
                         self.visible_len(),
-                        cx.processor(|this, range: Range<usize>, _, cx| {
-                            range.map(|index| this.render_row(index, cx)).collect()
+                        cx.processor(move |this, range: Range<usize>, _, cx| {
+                            range
+                                .map(|index| this.render_row(index, wide, cx))
+                                .collect()
                         }),
                     )
                     .size_full()
@@ -617,271 +1763,967 @@ impl Render for AppView {
                 .into_any_element()
         };
 
-        let sidebar = div()
-            .w(px(210.0))
-            .h_full()
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .border_r_1()
-            .border_color(cx.theme().border)
-            .child(div().text_2xl().child("Clean"))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("磁盘空间分析"),
-            )
-            .child(
-                Button::new("home")
-                    .label("扫描主目录")
-                    .disabled(busy || !has_home)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(home) = home.clone() {
-                            this.start_scan(home, cx);
-                        }
-                    })),
-            )
-            .child(
-                Button::new("downloads")
-                    .label("扫描下载目录")
-                    .disabled(busy || !has_home)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(path) = downloads.clone() {
-                            this.start_scan(path, cx);
-                        }
-                    })),
-            )
-            .child(
-                Button::new("choose")
-                    .label("选择其他目录…")
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, _, cx| this.choose_directory(cx))),
-            )
-            .child(div().h_4())
-            .child(
-                Button::new("overview")
-                    .label("目录分析")
-                    .disabled(self.results.is_empty())
-                    .on_click(cx.listener(|this, _, _, cx| this.show_page(Page::Directory, cx))),
-            )
-            .child(
-                Button::new("large-files")
-                    .label("大文件")
-                    .disabled(self.results.is_empty())
-                    .on_click(cx.listener(|this, _, _, cx| this.show_page(Page::LargeFiles, cx))),
-            )
-            .child(
-                Button::new("issues")
-                    .label(format!("扫描问题 ({})", self.results.issues.len()))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_page(Page::Issues, cx);
-                    })),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("仅分析，不删除任何文件。"),
-            );
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .bg(theme.background)
+            .child(self.render_content_toolbar(cx))
+            .child(self.render_table_header(wide, true, cx))
+            .child(content)
+            .into_any_element()
+    }
 
-        let cancel = Button::new("cancel")
-            .label(if self.cancelling {
-                "正在取消…"
-            } else {
-                "取消扫描"
-            })
-            .disabled(self.job.is_none() || self.cancelling)
-            .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(job) = &this.job {
-                    job.cancel();
-                    this.cancelling = true;
-                    cx.notify();
-                }
-            }));
-        let disk_label = match &self.disk_space {
-            Some(Ok(space)) => format!(
-                "所选卷容量 {} · 当前用户可用 {}（扫描开始时查询，与扫描总量独立）",
-                format_bytes(space.capacity),
-                format_bytes(space.available)
-            ),
-            Some(Err(error)) => format!("无法读取所选卷容量：{error}"),
-            None if self.scan_root.is_some() => "正在查询所选卷容量…".into(),
-            None => "选择目录后查询所选卷容量与可用空间。".into(),
+    fn render_overview_body(
+        &self,
+        wide: bool,
+        show_largest: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let count = self.visible_len();
+        let content = if count == 0 {
+            self.directory_empty_state(cx)
+        } else {
+            let scroll = self.overview_view.scroll.clone();
+            div()
+                .id("overview-list")
+                .flex_1()
+                .min_h_0()
+                .when_some(self.focus_handle.clone(), |this, handle| {
+                    this.track_focus(&handle).on_key_down(cx.listener(
+                        |this, event: &KeyDownEvent, _, cx| {
+                            this.handle_key(event, cx);
+                        },
+                    ))
+                })
+                .child(
+                    uniform_list(
+                        ("overview", 0usize),
+                        count,
+                        cx.processor(move |this, range: Range<usize>, _, cx| {
+                            range
+                                .map(|index| this.render_row(index, wide, cx))
+                                .collect()
+                        }),
+                    )
+                    .size_full()
+                    .track_scroll(&scroll),
+                )
+                .into_any_element()
         };
-        let summary = div().p_5().flex().flex_col().gap_2()
-            .border_b_1().border_color(cx.theme().border)
-            .child(div().flex().justify_between().items_center()
-                .child(div().text_lg().child(self.results.state.label())).child(cancel))
-            .child(div().text_sm().truncate().text_color(cx.theme().muted_foreground)
-                .child(root_path.unwrap_or_else(|| "尚未选择扫描位置".into())))
-            .child(div().text_2xl().child(format!("已分配空间 {} · {} 个文件路径 · {} 个目录",
-                allocated_size, self.results.files, self.results.directories)))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!(
-                "硬链接仅计入首次发现路径（去重 {} 条） · 跳过 {} 个符号链接 · 非独占或可释放空间",
-                self.results.hard_links, self.results.symlinks)))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(disk_label))
-            .children(self.capacity_notice().map(|notice| div().text_sm().child(notice)))
-            .children(self.notice.clone().map(|notice| div().text_sm().child(notice)));
 
-        let crumbs = ancestors.into_iter().map(|id| {
-            let name = if id == 0 {
-                "扫描根目录".to_string()
-            } else {
-                self.results.name(id).to_string_lossy().into_owned()
-            };
-            Button::new(("breadcrumb", id))
-                .label(name)
-                .on_click(cx.listener(move |this, _, _, cx| this.navigate(id, true, cx)))
+        let largest_len = self
+            .large_files
+            .visible_len(&self.results, LARGE_FILE_FLOOR)
+            .min(6);
+        let largest = (show_largest && largest_len > 0).then(|| {
+            v_flex()
+                .flex_shrink_0()
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    h_flex()
+                        .h(px(34.0))
+                        .px_3()
+                        .gap_2()
+                        .child(div().text_size(px(11.0)).font_medium().child("最大的文件"))
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.muted_foreground)
+                                .child("≥ 100 MiB · 已去重的普通文件"),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("all-large-files")
+                                .with_size(Size::Small)
+                                .label("查看全部")
+                                .ghost()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_page(Page::LargeFiles, cx)
+                                })),
+                        ),
+                )
+                .children((0..largest_len).map(|index| {
+                    let id = self.large_files.visible_id(LARGE_FILE_FLOOR, index);
+                    self.render_compact_file_row(id, cx)
+                }))
         });
-        let breadcrumbs = div()
-            .px_4()
-            .py_2()
+
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .h(px(40.0))
+                    .px_3()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().text_size(px(11.0)).font_medium().child("空间去向"))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "{} 个顶层条目 · 按已分配空间排序",
+                                format_count(count)
+                            )),
+                    ),
+            )
+            .child(self.render_table_header(wide, true, cx))
+            .child(content)
+            .children(largest)
+            .into_any_element()
+    }
+
+    fn render_compact_file_row(&self, id: NodeId, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let name = self.results.name(id).to_string_lossy().into_owned();
+        let parent = self
+            .results
+            .parent(id)
+            .map(|parent| self.results.path(parent).display().to_string())
+            .unwrap_or_default();
+        let selected = self.overview_view.selected == Some(id);
+        div()
+            .id(ElementId::named_usize("overview-file", id))
+            .w_full()
+            .h(px(SMALL_ROW_HEIGHT))
+            .px_3()
+            .gap_3()
             .flex()
             .items_center()
-            .gap_2()
+            .border_b_1()
+            .border_color(theme.border.opacity(0.45))
+            .bg(if selected {
+                theme.list_active
+            } else {
+                theme.transparent
+            })
+            .when(!selected, |this| {
+                this.hover(|style| style.bg(theme.list_hover))
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.focus_list(window, cx);
+                this.overview_view.selected = Some(id);
+                if event.click_count() == 2 {
+                    this.open_parent();
+                }
+                cx.notify();
+            }))
             .child(
-                Button::new("back")
-                    .label("返回")
-                    .disabled(self.history.is_empty())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(id) = this.history.pop() {
-                            this.navigate(id, false, cx);
-                        }
-                    })),
+                Icon::new(IconName::File)
+                    .with_size(px(13.0))
+                    .text_color(theme.muted_foreground),
             )
             .child(
                 div()
-                    .id("breadcrumbs")
                     .flex_1()
                     .min_w_0()
-                    .overflow_x_scroll()
-                    .child(div().flex().gap_2().children(crumbs)),
-            );
+                    .text_size(px(11.5))
+                    .truncate()
+                    .child(name),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(10.0))
+                    .text_color(theme.muted_foreground)
+                    .truncate()
+                    .child(parent),
+            )
+            .child(
+                div()
+                    .w(px(56.0))
+                    .text_right()
+                    .text_size(px(10.0))
+                    .text_color(theme.muted_foreground)
+                    .font_features(tabular_numbers())
+                    .child(self.share_label(id)),
+            )
+            .child(
+                div()
+                    .w(px(88.0))
+                    .text_right()
+                    .text_size(px(11.5))
+                    .font_features(tabular_numbers())
+                    .child(self.entry_size(id)),
+            )
+            .into_any_element()
+    }
 
-        let toolbar = match self.page {
-            Page::Directory => breadcrumbs.into_any_element(),
-            Page::LargeFiles => div()
-                .px_4()
-                .py_2()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().text_sm().child("最小已分配空间"))
-                .children(
-                    [
-                        (0, "全部文件"),
-                        (100 * 1024 * 1024, "100 MiB"),
-                        (1024 * 1024 * 1024, "1 GiB"),
-                        (10 * 1024 * 1024 * 1024, "10 GiB"),
-                    ]
-                    .into_iter()
-                    .map(|(minimum, label)| {
-                        Button::new(("minimum", minimum as usize))
-                            .label(if self.minimum_bytes == minimum {
-                                format!("✓ {label}")
-                            } else {
-                                label.into()
-                            })
+    fn render_large_files_body(&self, wide: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let content = if self.visible_len() == 0 {
+            let scanning = self.results.state == ScanState::Scanning;
+            self.render_empty_state(
+                if scanning {
+                    "尚未发现符合条件的大文件"
+                } else {
+                    "当前阈值下没有文件"
+                },
+                if scanning {
+                    "扫描仍在继续；可以降低阈值或等待更多结果。"
+                } else {
+                    "降低最小已分配空间阈值，或选择其他位置重新扫描。"
+                },
+                IconName::Files,
+                scanning,
+                cx,
+            )
+        } else {
+            let scroll = self.large_file_view.scroll.clone();
+            div()
+                .id("large-file-list")
+                .flex_1()
+                .min_h_0()
+                .when_some(self.focus_handle.clone(), |this, handle| {
+                    this.track_focus(&handle).on_key_down(cx.listener(
+                        |this, event: &KeyDownEvent, _, cx| {
+                            this.handle_key(event, cx);
+                        },
+                    ))
+                })
+                .child(
+                    uniform_list(
+                        ("large-files", 0usize),
+                        self.visible_len(),
+                        cx.processor(move |this, range: Range<usize>, _, cx| {
+                            range
+                                .map(|index| this.render_row(index, wide, cx))
+                                .collect()
+                        }),
+                    )
+                    .size_full()
+                    .track_scroll(&scroll),
+                )
+                .into_any_element()
+        };
+
+        let thresholds = [
+            (LARGE_FILE_FLOOR, "≥100 MiB"),
+            (1024 * 1024 * 1024, "≥1 GiB"),
+            (10 * 1024 * 1024 * 1024, "≥10 GiB"),
+            (0, "全部文件"),
+        ];
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .h(px(40.0))
+                    .px_3()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        v_flex()
+                            .gap_0()
+                            .child(div().text_size(px(11.0)).font_medium().child("大文件"))
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child("整个扫描范围 · 普通文件 · 已去重"),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .children(thresholds.into_iter().map(|(minimum, label)| {
+                        let selected = self.minimum_bytes == minimum;
+                        Button::new(("threshold", minimum as usize))
+                            .with_size(Size::Small)
+                            .label(label)
+                            .when(selected, |button| button.secondary())
+                            .when(!selected, |button| button.ghost())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.set_minimum(minimum);
                                 cx.notify();
                             }))
-                    }),
+                    })),
+            )
+            .child(self.render_table_header(wide, false, cx))
+            .child(content)
+            .into_any_element()
+    }
+
+    fn render_issues_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let issue_border = theme.border.opacity(0.55);
+        let issue_icon = theme.yellow;
+        let issue_muted = theme.muted_foreground;
+        let content = if self.results.issues.is_empty() {
+            let scanning = self.results.state == ScanState::Scanning;
+            self.render_empty_state(
+                if scanning {
+                    "正在扫描，暂无读取失败"
+                } else {
+                    "没有读取失败"
+                },
+                if scanning {
+                    "无法读取的路径会在扫描过程中出现在这里。"
+                } else {
+                    "本次扫描没有遇到无法读取的目录或文件。"
+                },
+                IconName::ShieldCheck,
+                scanning,
+                cx,
+            )
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    uniform_list(
+                        ("issues", 0usize),
+                        self.results.issues.len(),
+                        cx.processor(move |this, range: Range<usize>, _, _| {
+                            range
+                                .map(|index| {
+                                    let issue = &this.results.issues[index];
+                                    div()
+                                        .w_full()
+                                        .min_h(px(54.0))
+                                        .px_3()
+                                        .py_2()
+                                        .gap_3()
+                                        .flex()
+                                        .items_start()
+                                        .border_b_1()
+                                        .border_color(issue_border)
+                                        .child(
+                                            Icon::new(IconName::TriangleAlert)
+                                                .with_size(px(13.0))
+                                                .text_color(issue_icon),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.5))
+                                                        .truncate()
+                                                        .child(issue.path.display().to_string()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.0))
+                                                        .text_color(issue_muted)
+                                                        .line_clamp(2)
+                                                        .child(issue.message.clone()),
+                                                ),
+                                        )
+                                        .into_any_element()
+                                })
+                                .collect()
+                        }),
+                    )
+                    .size_full()
+                    .track_scroll(&self.issue_scroll),
+                )
+                .into_any_element()
+        };
+
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .h(px(40.0))
+                    .px_3()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_medium()
+                            .child("读取失败与扫描问题"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .child(format_count(self.results.issues.len())),
+                    ),
+            )
+            .child(content)
+            .into_any_element()
+    }
+
+    fn render_inspector(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let selected = self.selected();
+        let body = match selected {
+            None => v_flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p_6()
+                .child(
+                    Icon::new(IconName::MousePointer2)
+                        .with_size(px(20.0))
+                        .text_color(theme.muted_foreground),
+                )
+                .child(div().text_size(px(12.0)).child("选择一个条目查看详情"))
+                .child(
+                    div()
+                        .max_w(px(220.0))
+                        .text_center()
+                        .text_size(px(10.0))
+                        .text_color(theme.muted_foreground)
+                        .child("显示完整路径、大小占比、扫描状态与归属说明。"),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .text_size(px(10.0))
+                        .text_color(theme.muted_foreground)
+                        .child("Clean 只读取文件系统信息，不修改任何文件。"),
                 )
                 .into_any_element(),
-            Page::Issues => div().into_any_element(),
+            Some(id) => {
+                let name = self.results.name(id).to_string_lossy().into_owned();
+                let path = self.results.to_path_buf(id);
+                let size = self.entry_size(id);
+                let share = self.share_label(id);
+                let is_directory = self.results.kind(id) == EntryKind::Directory;
+                let mut details = Vec::new();
+                if self.page == Page::Directory
+                    && self.directory != 0
+                    && self.results.hard_link_to(id).is_none()
+                {
+                    details.push(("占扫描总量", self.root_share_label(id)));
+                }
+                if is_directory {
+                    details.push(("直接子项", format_count(self.results.child_count(id))));
+                    details.push(("扫描状态", self.directory_state_label(id)));
+                }
+                if self.results.errors(id) > 0 {
+                    details.push((
+                        "读取失败",
+                        format!("{} 项", format_count(self.results.errors(id))),
+                    ));
+                }
+                if let Some(owner) = self.results.hard_link_to(id) {
+                    details.push(("已计入", self.results.path(owner).display().to_string()));
+                }
+
+                v_flex()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_start()
+                            .child(self.entry_icon(id, cx))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_0()
+                                    .child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .font_medium()
+                                            .truncate()
+                                            .child(name),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(theme.muted_foreground)
+                                            .child(self.kind_label(id)),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_baseline()
+                            .child(
+                                div()
+                                    .text_size(px(21.0))
+                                    .font_semibold()
+                                    .font_features(tabular_numbers())
+                                    .child(size),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("{} {}", self.share_caption(), share)),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).w_full().bg(theme.border))
+                    .children(
+                        details
+                            .into_iter()
+                            .map(|(label, value)| detail_row(label, value, &theme)),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child("完整路径"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .font_family(theme.mono_font_family.clone())
+                                    .whitespace_normal()
+                                    .line_clamp(4)
+                                    .child(path.display().to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .p_2()
+                            .rounded(px(5.0))
+                            .bg(theme.muted)
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .whitespace_normal()
+                            .child(self.explanation(id)),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .children(is_directory.then(|| {
+                                Button::new("enter-directory")
+                                    .with_size(Size::Small)
+                                    .w_full()
+                                    .label("进入目录")
+                                    .icon(IconName::CornerDownRight)
+                                    .secondary()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.navigate(id, true, cx)
+                                    }))
+                            }))
+                            .children((self.page == Page::LargeFiles).then(|| {
+                                Button::new("go-parent")
+                                    .with_size(Size::Small)
+                                    .w_full()
+                                    .label("前往所在目录")
+                                    .icon(IconName::CornerDownRight)
+                                    .secondary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_parent();
+                                        cx.notify();
+                                    }))
+                            }))
+                            .child(
+                                Button::new("inspector-reveal")
+                                    .with_size(Size::Small)
+                                    .w_full()
+                                    .label(if self.revealing {
+                                        "正在定位…"
+                                    } else {
+                                        "在 Finder 中显示"
+                                    })
+                                    .icon(IconName::FolderSearch)
+                                    .secondary()
+                                    .disabled(self.revealing)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.reveal_selected(cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("inspector-copy")
+                                    .with_size(Size::Small)
+                                    .w_full()
+                                    .label("复制路径")
+                                    .icon(IconName::Copy)
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| this.copy_selected(cx))),
+                            ),
+                    )
+                    .into_any_element()
+            }
         };
-        let heading = div()
-            .px_4()
-            .py_2()
-            .flex()
-            .justify_between()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(if self.page == Page::Issues {
-                "读取失败与扫描问题"
-            } else if self.page == Page::LargeFiles {
-                "大文件 · 整个扫描范围（含子目录）"
+
+        v_flex()
+            .w(px(INSPECTOR_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .p_3()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    fn root_share_label(&self, id: NodeId) -> String {
+        if self.results.is_empty() || self.results.root_overflow() || self.page == Page::Issues {
+            return "—".into();
+        }
+        if self.results.hard_link_to(id).is_some() {
+            return "已去重".into();
+        }
+        let total = self.results.root_bytes();
+        if total == 0 {
+            return "—".into();
+        }
+        let ratio = (self.results.bytes(id) as f64 / total as f64) as f32;
+        if ratio > 0.0 && ratio < 0.001 {
+            "<0.1%".into()
+        } else {
+            format!("{:.1}%", ratio * 100.0)
+        }
+    }
+
+    fn directory_state_label(&self, id: NodeId) -> String {
+        if self.results.size_overflow(id) {
+            return "大小超出统计范围".into();
+        }
+        if self.results.errors(id) > 0 {
+            return format!("{} 项读取失败", format_count(self.results.errors(id)));
+        }
+        if !self.results.is_complete(id) {
+            return if self.results.state == ScanState::Scanning {
+                "正在扫描".into()
             } else {
-                "目录分析 · 双击目录进入"
-            })
-            .child(if self.page == Page::Issues {
-                ""
-            } else if self.page == Page::LargeFiles {
-                "占扫描总量 / 已分配空间 ↓"
-            } else {
-                "占当前目录 / 已分配空间 ↓"
-            });
-        let footer = div()
-            .px_4()
-            .py_3()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(
-                div().flex_1().min_w_0().text_sm().truncate().child(
-                    selected_path
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "选择条目查看完整路径".into()),
-                ),
-            )
-            .child(
-                Button::new("parent")
-                    .label("所在目录")
-                    .disabled(self.page != Page::LargeFiles || selected.is_none())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_parent();
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("reveal")
-                    .label(if self.revealing {
-                        "正在定位…"
-                    } else {
-                        "在 Finder 中显示"
-                    })
-                    .disabled(selected.is_none() || self.revealing)
-                    .on_click(cx.listener(|this, _, _, cx| this.reveal_selected(cx))),
-            )
-            .child(
-                Button::new("copy")
-                    .label("复制路径")
-                    .disabled(selected_path.is_none())
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        if let Some(path) = &selected_path {
-                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                path.display().to_string(),
-                            ));
-                        }
-                    })),
+                "尚未扫描完整".into()
+            };
+        }
+        "完整".into()
+    }
+
+    fn explanation(&self, id: NodeId) -> String {
+        if let Some(owner) = self.results.hard_link_to(id) {
+            return format!(
+                "此路径是同一文件的硬链接别名。空间已计入首次发现的路径 {}，不重复统计。",
+                self.results.path(owner).display()
             );
+        }
+        match self.results.kind(id) {
+            EntryKind::Symlink => "符号链接不计入空间总量，扫描不会跟随链接目标。".into(),
+            EntryKind::Other => "特殊文件（设备、管道等）不计入空间总量。".into(),
+            EntryKind::Directory if self.results.size_overflow(id) => {
+                "该目录的已分配空间超出统计范围，大小与占比不精确。".into()
+            }
+            EntryKind::Directory if self.results.errors(id) > 0 => {
+                "部分内容无法读取，其空间尚未计入。这不表示这些路径是空的。".into()
+            }
+            EntryKind::Directory if !self.results.is_complete(id) => {
+                if self.results.state == ScanState::Scanning {
+                    "该目录仍在扫描，当前大小会继续增加。".into()
+                } else {
+                    "该目录未扫描完整，当前大小不是最终值。".into()
+                }
+            }
+            EntryKind::Directory if self.results.child_count(id) == 0 => {
+                "这是一个空目录。目录自身仍可能有少量分配空间。".into()
+            }
+            _ => "大小为文件系统报告的已分配空间；它不是独占占用，也不等于删除后可释放的空间。"
+                .into(),
+        }
+    }
+
+    fn render_onboarding(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let home = platform::home_directory();
+        let downloads = home.as_ref().map(|home| home.join("Downloads"));
+        let home_enabled = home.is_some() && !self.choosing;
+        let downloads_enabled = downloads.is_some() && !self.choosing;
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .p_8()
+            .child(
+                div()
+                    .size(px(48.0))
+                    .rounded(px(12.0))
+                    .bg(theme.muted)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::HardDrive)
+                            .with_size(px(24.0))
+                            .text_color(theme.chart_2),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(18.0))
+                            .font_semibold()
+                            .child("分析磁盘空间去了哪里"),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(460.0))
+                            .text_center()
+                            .text_size(px(12.0))
+                            .text_color(theme.muted_foreground)
+                            .child(
+                                "选择一个位置，Clean 会按文件系统报告的已分配空间统计目录与文件。扫描期间即可浏览，随时可以停止。",
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .when_some(home, |this, home| {
+                        this.child(
+                            Button::new("onboard-home")
+                                .label("扫描主目录")
+                                .icon(IconName::House)
+                                .primary()
+                                .disabled(!home_enabled)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.start_scan(home.clone(), cx)
+                                })),
+                        )
+                    })
+                    .when_some(downloads, |this, downloads| {
+                        this.child(
+                            Button::new("onboard-downloads")
+                                .label("下载")
+                                .icon(IconName::Download)
+                                .secondary()
+                                .disabled(!downloads_enabled)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.start_scan(downloads.clone(), cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("onboard-choose")
+                            .label("选择目录…")
+                            .icon(IconName::FolderOpen)
+                            .ghost()
+                            .disabled(self.choosing)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.choose_directory(cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.muted_foreground)
+                    .child("只读分析 · 不删除或修改任何文件"),
+            )
+            .into_any_element()
+    }
+
+    fn render_status_bar(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let selected = self.selected();
+        let left = if let Some(id) = selected {
+            let path = self.results.to_path_buf(id);
+            h_flex()
+                .gap_2()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(10.0))
+                        .text_color(theme.muted_foreground)
+                        .child(path.display().to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.muted_foreground)
+                        .font_features(tabular_numbers())
+                        .child(self.entry_size(id)),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .text_size(px(10.0))
+                .text_color(theme.muted_foreground)
+                .child("已分配空间不等于可释放空间 · 选择条目查看完整路径")
+                .into_any_element()
+        };
+
+        h_flex()
+            .h(px(26.0))
+            .px_3()
+            .gap_3()
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.status_bar)
+            .child(left)
+            .child(div().flex_1())
+            .when(!compact, |this| {
+                this.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.muted_foreground)
+                        .child("↑↓ 选择 · Enter 进入 · ⌫ 返回 · ⌘C 复制 · ⌘I 详情"),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+impl Render for AppView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let background = cx.theme().background;
+        let foreground = cx.theme().foreground;
+        let width = window.viewport_size().width.as_f32();
+        let height = window.viewport_size().height.as_f32();
+        let compact = width < 980.0;
+        let wide_rows = width >= 1000.0;
+        let show_inspector = self.show_inspector && width >= 1080.0 && self.page != Page::Issues;
+        let has_scan = self.scan_root.is_some();
+        let idle = self.results.state == ScanState::Idle && !has_scan && self.results.is_empty();
+
+        let sidebar = self.render_sidebar(cx);
+        let topbar = self.render_topbar(compact, cx);
+        let status = self.render_status_bar(compact, cx);
+        let summary = (!idle).then(|| self.render_summary(compact, cx));
+        let body = if idle {
+            self.render_onboarding(cx)
+        } else {
+            let content = match self.page {
+                Page::Overview => self.render_overview_body(wide_rows, height >= 620.0, cx),
+                Page::Directory => self.render_directory_body(wide_rows, cx),
+                Page::LargeFiles => self.render_large_files_body(wide_rows, cx),
+                Page::Issues => self.render_issues_body(cx),
+            };
+            let mut body = div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(content);
+            if show_inspector {
+                body = body.child(self.render_inspector(cx));
+            }
+            body.into_any_element()
+        };
+
+        let mut main = v_flex().flex_1().min_w_0().h_full();
+        main = main.child(topbar);
+        if let Some(summary) = summary {
+            main = main.child(summary);
+        }
+        main = main.child(body).child(status);
 
         div()
             .size_full()
             .flex()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
+            .bg(background)
+            .text_color(foreground)
             .child(sidebar)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .child(summary)
-                    .child(toolbar)
-                    .child(heading)
-                    .child(content)
-                    .child(footer),
-            )
+            .child(main)
+    }
+}
+
+fn section_label(text: &str, color: Hsla) -> AnyElement {
+    div()
+        .h(px(22.0))
+        .px_2()
+        .flex()
+        .items_center()
+        .text_size(px(9.5))
+        .text_color(color)
+        .child(text.to_string())
+        .into_any_element()
+}
+
+fn metric(label: &str, value: String, theme: &Theme) -> AnyElement {
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(theme.muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .font_medium()
+                .font_features(tabular_numbers())
+                .child(value),
+        )
+        .into_any_element()
+}
+
+fn detail_row(label: &str, value: String, theme: &Theme) -> AnyElement {
+    h_flex()
+        .justify_between()
+        .items_start()
+        .gap_3()
+        .text_size(px(10.5))
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(theme.muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .text_right()
+                .whitespace_normal()
+                .child(value),
+        )
+        .into_any_element()
+}
+
+fn tabular_numbers() -> FontFeatures {
+    FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]))
+}
+
+fn format_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            output.push(',');
+        }
+        output.push(ch);
+    }
+    output
+}
+
+fn duration_text(duration: Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    if seconds < 60.0 {
+        return format!("{seconds:.1} 秒");
+    }
+    let minutes = duration.as_secs() / 60;
+    let rest = duration.as_secs() % 60;
+    if minutes < 60 {
+        format!("{minutes} 分 {rest:02} 秒")
+    } else {
+        let hours = minutes / 60;
+        format!("{hours} 小时 {:02} 分", minutes % 60)
     }
 }
 
