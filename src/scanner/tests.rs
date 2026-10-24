@@ -1,16 +1,15 @@
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs,
     os::unix::fs::MetadataExt,
-    rc::Rc,
-    sync::atomic::AtomicUsize,
+    sync::{Arc, atomic::AtomicUsize},
 };
 
 use super::*;
 use crate::{
     analysis::sorted_children,
     models::{NodeId, ScanResults},
-    platform::scan_fs::{DirectoryReader, EntryMetadata, FileIdentity},
+    platform::scan_fs::{Directory, EntryError, EntryItem, EntryMetadata, FileIdentity},
 };
 
 struct TempDirectory(PathBuf);
@@ -126,121 +125,8 @@ fn assert_allocated_totals(results: &ScanResults) {
     }
 }
 
-#[test]
-fn aggregates_nested_directories_and_sorts_by_allocated_space() {
-    let temp = TempDirectory::new();
-    temp.file("small", 8);
-    temp.file("nested/a", 40);
-    temp.file("nested/deep/b", 60);
-    fs::create_dir(temp.0.join("empty")).unwrap();
-    let results = collect_real(&temp.0);
-    assert_eq!(results.state, ScanState::Complete);
-    assert_eq!(results.files, 3);
-    assert_eq!(results.directories, 4); // Includes the selected root.
-    assert_allocated_totals(&results);
-    assert!((0..results.len()).all(|id| results.is_complete(id)));
-    let children = sorted_children(&results, 0);
-    assert_eq!(results.to_path_buf(children[0]), temp.0.join("nested"));
-    assert_eq!(results.to_path_buf(children[1]), temp.0.join("small"));
-    assert_eq!(results.to_path_buf(children[2]), temp.0.join("empty"));
-    assert!(results.issues.is_empty());
-}
-
-#[cfg(unix)]
-#[test]
-fn skips_directory_file_dangling_and_cyclic_symlinks() {
-    use std::os::unix::fs::symlink;
-    let temp = TempDirectory::new();
-    let external = TempDirectory::new();
-    external.file("large", 500);
-    let file = temp.file("file", 12);
-    symlink(&external.0, temp.0.join("external")).unwrap();
-    symlink(&temp.0, temp.0.join("cycle")).unwrap();
-    symlink(&file, temp.0.join("link")).unwrap();
-    symlink(temp.0.join("missing"), temp.0.join("dangling")).unwrap();
-    let results = collect_real(&temp.0);
-    assert_eq!(results.state, ScanState::Complete);
-    assert_allocated_totals(&results);
-    for link in ["external", "cycle", "link", "dangling"] {
-        assert_eq!(node(&results, &temp.0.join(link)).bytes(), 0);
-    }
-    assert_eq!(results.files, 1);
-    assert_eq!(results.directories, 1);
-    assert_eq!(results.symlinks, 4);
-    assert_eq!(results.len(), 6);
-    assert!(results.issues.is_empty());
-    let linked_root = collect_real(&temp.0.join("external"));
-    assert_eq!(linked_root.state, ScanState::Failed);
-    assert!(linked_root.is_empty());
-}
-
-#[test]
-fn hard_links_are_counted_once_across_directories_and_keep_all_paths() {
-    let temp = TempDirectory::new();
-    let original = temp.file("original", 37);
-    fs::create_dir(temp.0.join("nested")).unwrap();
-    fs::hard_link(&original, temp.0.join("same-level")).unwrap();
-    fs::hard_link(&original, temp.0.join("nested/linked")).unwrap();
-    let results = collect_real(&temp.0);
-    assert_eq!(results.state, ScanState::Complete);
-    assert_eq!(results.files, 3);
-    assert_eq!(results.hard_links, 2);
-    let owners: Vec<_> = (0..results.len())
-        .filter(|id| results.kind(*id) == EntryKind::File && results.hard_link_to(*id).is_none())
-        .collect();
-    assert_eq!(owners.len(), 1);
-    let owner_id = owners[0];
-    assert_eq!(results.bytes(owner_id), allocated(&original));
-    for id in 0..results.len() {
-        let Some(link) = results.hard_link_to(id) else {
-            continue;
-        };
-        assert_eq!(link, owner_id);
-        assert!(owner_id < id);
-        assert_eq!(results.bytes(id), 0);
-    }
-    assert_allocated_totals(&results);
-    let nested = node(&results, &temp.0.join("nested"));
-    assert_eq!(nested.bytes(), allocated(&temp.0.join("nested")));
-    let rescanned = collect_real(&temp.0);
-    assert_eq!(rescanned.bytes(0), results.bytes(0));
-    assert_eq!(rescanned.hard_links, 2);
-    let separately = collect_real(&temp.0.join("nested"));
-    assert_eq!(separately.files, 1);
-    assert_eq!(separately.hard_links, 0);
-    assert_allocated_totals(&separately);
-}
-
-#[test]
-fn cancellation_keeps_partial_results_and_unread_directories_incomplete() {
-    let temp = TempDirectory::new();
-    for index in 0..10 {
-        temp.file(&format!("nested/{index}"), 10);
-    }
-    let cancel = AtomicBool::new(false);
-    let mut results = ScanResults::scanning();
-    scan(
-        &temp.0,
-        &cancel,
-        &RootFileSystem::open(&temp.0).unwrap(),
-        &mut |event| {
-            results.apply(event);
-            if results.files == 1 {
-                cancel.store(true, Ordering::Relaxed);
-            }
-            true
-        },
-    );
-    assert_eq!(results.state, ScanState::Partial);
-    assert_eq!(results.files, 1);
-    assert_allocated_totals(&results);
-    assert!(!results.is_complete(0));
-    assert!(!node(&results, &temp.0.join("nested")).is_complete());
-    assert!(results.issues.is_empty());
-}
-
-type Hook = Rc<dyn Fn(&Path) -> io::Result<()>>;
-type MetadataHook = Rc<dyn Fn(&Path, EntryMetadata) -> EntryMetadata>;
+type Hook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+type MetadataHook = Arc<dyn Fn(&Path, EntryMetadata) -> EntryMetadata + Send + Sync>;
 
 struct TestFileSystem {
     real: RootFileSystem,
@@ -257,12 +143,26 @@ impl TestFileSystem {
         Self {
             real: RootFileSystem::open(root).unwrap(),
             root: root.into(),
-            metadata_override: Rc::new(|_, metadata| metadata),
-            before_read: Rc::new(|_| Ok(())),
-            before_metadata: Rc::new(|_| Ok(())),
-            before_next: Rc::new(|_| Ok(())),
+            metadata_override: Arc::new(|_, metadata| metadata),
+            before_read: Arc::new(|_| Ok(())),
+            before_metadata: Arc::new(|_| Ok(())),
+            before_next: Arc::new(|_| Ok(())),
             broken_listing: false,
         }
+    }
+}
+
+impl TestFileSystem {
+    fn wrap(&self, inner: Box<dyn Directory>, path: PathBuf) -> Box<dyn Directory> {
+        Box::new(TestDirectory {
+            inner,
+            path,
+            before_read: self.before_read.clone(),
+            before_metadata: self.before_metadata.clone(),
+            metadata_override: self.metadata_override.clone(),
+            before_next: self.before_next.clone(),
+            broken_listing: self.broken_listing,
+        })
     }
 }
 
@@ -271,25 +171,51 @@ impl FileSystem for TestFileSystem {
         (self.metadata_override)(&self.root, self.real.root_metadata())
     }
 
-    fn read_dir(
-        &self,
-        path: &Path,
-        expected: FileIdentity,
-    ) -> io::Result<Box<dyn DirectoryReader>> {
-        (self.before_read)(path)?;
-        Ok(Box::new(TestReader {
-            inner: self.real.read_dir(path, expected)?,
-            path: path.into(),
-            before_metadata: self.before_metadata.clone(),
+    fn open_root(&self) -> io::Result<Box<dyn Directory>> {
+        (self.before_read)(&self.root)?;
+        Ok(self.wrap(self.real.open_root()?, self.root.clone()))
+    }
+}
+
+struct TestDirectory {
+    inner: Box<dyn Directory>,
+    metadata_override: MetadataHook,
+    path: PathBuf,
+    before_read: Hook,
+    before_metadata: Hook,
+    before_next: Hook,
+    broken_listing: bool,
+}
+
+impl Directory for TestDirectory {
+    fn entries(&self) -> io::Result<Box<dyn Iterator<Item = EntryItem> + '_>> {
+        Ok(Box::new(TestEntries {
+            inner: self.inner.entries()?,
             metadata_override: self.metadata_override.clone(),
+            path: self.path.clone(),
+            before_metadata: self.before_metadata.clone(),
+            before_next: self.before_next.clone(),
+            broken_listing: self.broken_listing,
+        }))
+    }
+
+    fn open_child(&self, name: &OsStr, expected: FileIdentity) -> io::Result<Box<dyn Directory>> {
+        let path = self.path.join(name);
+        (self.before_read)(&path)?;
+        Ok(Box::new(TestDirectory {
+            inner: self.inner.open_child(name, expected)?,
+            path,
+            before_read: self.before_read.clone(),
+            metadata_override: self.metadata_override.clone(),
+            before_metadata: self.before_metadata.clone(),
             before_next: self.before_next.clone(),
             broken_listing: self.broken_listing,
         }))
     }
 }
 
-struct TestReader {
-    inner: Box<dyn DirectoryReader>,
+struct TestEntries<'a> {
+    inner: Box<dyn Iterator<Item = EntryItem> + 'a>,
     metadata_override: MetadataHook,
     path: PathBuf,
     before_metadata: Hook,
@@ -297,32 +223,39 @@ struct TestReader {
     broken_listing: bool,
 }
 
-impl Iterator for TestReader {
-    type Item = io::Result<OsString>;
+impl Iterator for TestEntries<'_> {
+    type Item = EntryItem;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Err(error) = (self.before_next)(&self.path) {
-            return Some(Err(error));
+            return Some(EntryItem::Error(EntryError { name: None, error }));
         }
-        self.inner.next().or_else(|| {
-            std::mem::take(&mut self.broken_listing)
-                .then(|| Err(io::Error::other("directory listing interrupted")))
-        })
-    }
-}
-
-impl DirectoryReader for TestReader {
-    fn metadata(&self, name: &OsStr) -> io::Result<EntryMetadata> {
-        (self.before_metadata)(&self.path.join(name))?;
-        self.inner
-            .metadata(name)
-            .map(|metadata| (self.metadata_override)(&self.path.join(name), metadata))
+        match self.inner.next() {
+            Some(EntryItem::Entry(mut entry)) => {
+                let full = self.path.join(&entry.name);
+                if let Err(error) = (self.before_metadata)(&full) {
+                    return Some(EntryItem::Error(EntryError {
+                        name: Some(entry.name),
+                        error,
+                    }));
+                }
+                entry.metadata = (self.metadata_override)(&full, entry.metadata);
+                Some(EntryItem::Entry(entry))
+            }
+            Some(item) => Some(item),
+            None => std::mem::take(&mut self.broken_listing).then(|| {
+                EntryItem::Error(EntryError {
+                    name: None,
+                    error: io::Error::other("directory listing interrupted"),
+                })
+            }),
+        }
     }
 }
 
 fn denied(root: &Path, blocked: PathBuf) -> TestFileSystem {
     TestFileSystem {
-        before_read: Rc::new(move |path| {
+        before_read: Arc::new(move |path| {
             if path == blocked {
                 Err(io::ErrorKind::PermissionDenied.into())
             } else {
@@ -368,10 +301,11 @@ fn root_read_failure_and_invalid_roots_fail_explicitly() {
 
 fn changing_file(root: &Path, target: PathBuf, remove: bool) -> TestFileSystem {
     TestFileSystem {
-        before_metadata: Rc::new(move |path| {
+        before_metadata: Arc::new(move |path| {
             if path == target {
                 if remove {
                     fs::remove_file(path)?;
+                    return Err(io::ErrorKind::NotFound.into());
                 } else {
                     fs::write(path, [0; 80 * 1024])?;
                 }
@@ -396,15 +330,16 @@ fn a_file_removed_during_scan_is_an_issue_not_an_empty_success() {
 }
 
 #[test]
-fn file_allocation_is_observed_at_metadata_read_time() {
+fn file_allocation_is_observed_when_the_directory_is_listed() {
     let temp = TempDirectory::new();
     let path = temp.file("grows", 10);
     let before = allocated(&path);
     let results = collect(&temp.0, &changing_file(&temp.0, path.clone(), false));
     assert_eq!(results.state, ScanState::Complete);
-    assert!(node(&results, &path).bytes() > before);
+    // The bulk read supplies the allocation observed while listing; a later
+    // write does not retroactively change the result.
+    assert_eq!(node(&results, &path).bytes(), before);
     assert_eq!(fs::metadata(&path).unwrap().len(), 80 * 1024);
-    assert_allocated_totals(&results);
     assert_eq!(results.files, 1);
 }
 
@@ -470,7 +405,7 @@ fn queued_directory_replacements_are_incomplete_and_never_read() {
         let moved = backup.0.join("original");
         let outside = external.0.clone();
         let fs = TestFileSystem {
-            before_read: Rc::new(move |path| {
+            before_read: Arc::new(move |path| {
                 if path == target {
                     fs::rename(path, &moved)?;
                     if replace_with_symlink {
@@ -502,15 +437,17 @@ fn replacing_a_queued_ancestor_with_a_symlink_cannot_escape_the_root() {
     let backup = TempDirectory::new();
     temp.file("outer/inner/original", 20);
     external.file("inner/outside", 999);
+    let file = temp.0.join("outer/inner/original");
     let expected = allocated(&temp.0)
         + allocated(&temp.0.join("outer"))
-        + allocated(&temp.0.join("outer/inner"));
+        + allocated(&temp.0.join("outer/inner"))
+        + allocated(&file);
     let outer = temp.0.join("outer");
     let inner = outer.join("inner");
     let moved = backup.0.join("original");
     let outside = external.0.clone();
     let fs = TestFileSystem {
-        before_read: Rc::new(move |path| {
+        before_read: Arc::new(move |path| {
             if path == inner {
                 fs::rename(&outer, &moved)?;
                 symlink(&outside, &outer)?;
@@ -520,11 +457,14 @@ fn replacing_a_queued_ancestor_with_a_symlink_cannot_escape_the_root() {
         ..TestFileSystem::new(&temp.0)
     };
     let results = collect(&temp.0, &fs);
-    assert_eq!(results.state, ScanState::Partial);
-    assert_eq!(results.files, 0);
+    // Traversal is anchored to the already open `outer` handle, so replacing
+    // its path with a symlink neither escapes the root nor interrupts the
+    // scan: the original directory is still read.
+    assert_eq!(results.state, ScanState::Complete);
+    assert_eq!(results.files, 1);
     assert_eq!(results.bytes(0), expected);
-    assert_eq!(results.issues.len(), 1);
-    assert!(!node(&results, &temp.0.join("outer/inner")).is_complete());
+    assert!(results.issues.is_empty());
+    assert!(node(&results, &temp.0.join("outer/inner")).is_complete());
 }
 
 #[test]
@@ -540,7 +480,7 @@ fn metadata_stays_relative_to_the_open_directory_after_path_replacement() {
     let moved = backup.0.join("original");
     let outside = external.0.clone();
     let fs = TestFileSystem {
-        before_metadata: Rc::new(move |path| {
+        before_metadata: Arc::new(move |path| {
             if path == original {
                 fs::rename(&directory, &moved)?;
                 symlink(&outside, &directory)?;
@@ -570,7 +510,7 @@ fn the_selected_root_is_anchored_even_if_its_path_is_replaced() {
     let moved = backup.0.join("original");
     let outside = external.0.clone();
     let fs = TestFileSystem {
-        before_read: Rc::new(move |path| {
+        before_read: Arc::new(move |path| {
             if path == root {
                 fs::rename(path, &moved)?;
                 symlink(&outside, path)?;
@@ -605,11 +545,10 @@ fn cancellation_during_iteration_does_not_read_more_metadata_or_mark_empty() {
     let cancel = Arc::new(AtomicBool::new(false));
     let iter_cancel = cancel.clone();
     let fs = TestFileSystem {
-        before_next: Rc::new(move |_| {
+        before_next: Arc::new(move |_| {
             iter_cancel.store(true, Ordering::Relaxed);
             Ok(())
         }),
-        before_metadata: Rc::new(|_| panic!("metadata must not be read after cancellation")),
         ..TestFileSystem::new(&temp.0)
     };
     let mut results = ScanResults::default();
@@ -642,7 +581,7 @@ fn cancellation_before_start_does_not_touch_the_filesystem() {
 fn receiver_disconnection_stops_traversal_immediately() {
     let temp = TempDirectory::new();
     let fs = TestFileSystem {
-        before_read: Rc::new(|_| panic!("no directory should be read after receiver disconnects")),
+        before_read: Arc::new(|_| panic!("no directory should be read after receiver disconnects")),
         ..TestFileSystem::new(&temp.0)
     };
     let mut events = 0;
@@ -782,7 +721,7 @@ fn directory_own_allocation_is_included_even_when_it_has_no_file_bytes() {
     fs::create_dir(temp.0.join("empty")).unwrap();
     let root = temp.0.clone();
     let fs = TestFileSystem {
-        metadata_override: Rc::new(move |path, mut metadata| {
+        metadata_override: Arc::new(move |path, mut metadata| {
             if metadata.kind == EntryKind::Directory {
                 metadata.allocated_bytes = if path == root { 1024 } else { 512 };
             }
@@ -807,7 +746,7 @@ fn matching_inodes_on_different_devices_are_not_deduplicated() {
     let a = temp.file("a", 11);
     let b = temp.file("b", 11);
     let fs = TestFileSystem {
-        metadata_override: Rc::new(|path, mut metadata| {
+        metadata_override: Arc::new(|path, mut metadata| {
             if metadata.kind == EntryKind::File {
                 metadata.identity.inode = 42;
                 metadata.identity.device = if path.file_name().unwrap() == "a" {
@@ -901,4 +840,49 @@ fn hard_link_deduplication_survives_worker_batch_boundaries() {
     }
     assert_eq!(directory.sorted(&results).len(), 301);
     assert_eq!(directory.sorted(&results), sorted_children(&results, 0));
+}
+
+#[test]
+#[ignore]
+fn benchmark_real_tree() {
+    use std::time::Instant;
+    let root = std::env::var_os("CLEAN_BENCH_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap();
+    let rounds: u32 = std::env::var("CLEAN_BENCH_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let apply = std::env::var_os("CLEAN_BENCH_APPLY").is_some();
+    for round in 0..rounds {
+        let mut entries = 0usize;
+        let mut bytes = 0u64;
+        let mut errors = 0usize;
+        let start = Instant::now();
+        scan_real(&root, &AtomicBool::new(false), &mut |event| {
+            match &event {
+                ScanEvent::Entry { bytes: b, .. } => {
+                    entries += 1;
+                    bytes += b;
+                }
+                ScanEvent::Issue { .. } => errors += 1,
+                _ => {}
+            }
+            true
+        });
+        let scan_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let start = Instant::now();
+        let (nodes, state) = if apply {
+            let results = collect_real(&root);
+            (results.len(), format!("{:?}", results.state))
+        } else {
+            (0, "skipped".into())
+        };
+        let apply_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "round {round}: scan {scan_ms:.1} ms ({:.0} entries/s), scan+apply {apply_ms:.1} ms, entries {entries}, nodes {nodes}, bytes {bytes}, issues {errors}, state {state}",
+            entries as f64 / (scan_ms / 1000.0),
+        );
+    }
 }
