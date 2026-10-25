@@ -9,7 +9,7 @@ use std::{
         ffi::{OsStrExt, OsStringExt},
         io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
     },
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
     ptr,
 };
 
@@ -24,10 +24,11 @@ use windows_sys::{
     },
     Win32::{
         Foundation::{
-            ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER,
-            ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
-            STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
-            STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION, UNICODE_STRING,
+            DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL,
+            ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, HANDLE,
+            INVALID_HANDLE_VALUE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY,
+            STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION,
+            UNICODE_STRING,
         },
         Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -36,10 +37,10 @@ use windows_sys::{
             FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
             FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdExtdDirectoryInfo,
             FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetDriveTypeW,
-            GetFileInformationByHandleEx, GetVolumeInformationW, OPEN_EXISTING, ReOpenFile,
-            SYNCHRONIZE,
+            GetFileInformationByHandleEx, GetVolumeInformationW, OPEN_EXISTING, SYNCHRONIZE,
         },
         System::IO::IO_STATUS_BLOCK,
+        System::Threading::GetCurrentProcess,
     },
 };
 
@@ -71,7 +72,6 @@ const FSCTL_SET_SPARSE: u32 = 590_020;
 
 pub struct RootFileSystem {
     handle: OwnedHandle,
-    path: PathBuf,
     metadata: EntryMetadata,
     volume: u64,
 }
@@ -112,10 +112,9 @@ impl RootFileSystem {
             INVALID_IDENTITY
         };
         let volume = identity.volume;
-        let handle = reopen_for_listing(&probe, &path, identity)?;
+        let handle = open_directory(&path, identity)?;
         Ok(Self {
             handle,
-            path,
             metadata: EntryMetadata {
                 kind: EntryKind::Directory,
                 allocated_bytes,
@@ -133,42 +132,12 @@ impl FileSystem for RootFileSystem {
     }
 
     fn open_root(&self) -> io::Result<Box<dyn Directory>> {
-        // ReOpenFile creates a second handle to the same file object, so a
-        // renamed root keeps being read while enumeration state stays fresh.
-        let reopened = unsafe {
-            ReOpenFile(
-                raw_handle(&self.handle),
-                DIRECTORY_ACCESS,
-                SHARE_ALL,
-                OPEN_FLAGS,
-            )
-        };
-        if reopened != INVALID_HANDLE_VALUE {
-            return Ok(Box::new(WinDirectory {
-                // SAFETY: ReOpenFile returned a new owned handle.
-                handle: unsafe { OwnedHandle::from_raw_handle(reopened as RawHandle) },
-                volume: self.volume,
-            }));
-        }
-        // Some file systems reject ReOpenFile; fall back to the path while
-        // still verifying that it names the directory originally selected.
-        let file = open_path(&self.path, DIRECTORY_ACCESS)?;
-        let attributes: FILE_ATTRIBUTE_TAG_INFO =
-            get_info(raw_handle(&file), FileAttributeTagInfo)?;
-        if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        {
-            return Err(io::Error::other("扫描根目录在打开前已被替换，请重新选择。"));
-        }
-        if identity_valid(self.metadata.identity) {
-            let identity = get_info::<FILE_ID_INFO>(raw_handle(&file), FileIdInfo)
-                .map(|info| identity_from(&info))?;
-            if identity != self.metadata.identity {
-                return Err(io::Error::other("扫描根目录在打开前已被替换，请重新选择。"));
-            }
-        }
+        // Duplicating keeps the original file object, so the scan keeps
+        // reading it even if its path is renamed or replaced. The retained
+        // handle is never enumerated, so the shared directory cursor starts
+        // untouched.
         Ok(Box::new(WinDirectory {
-            handle: file,
+            handle: duplicate_handle(&self.handle)?,
             volume: self.volume,
         }))
     }
@@ -442,25 +411,16 @@ fn probe_reparse_tag(parent: HANDLE, name: &OsStr) -> Option<u32> {
     Some(attributes.ReparseTag)
 }
 
-fn reopen_for_listing(
-    probe: &OwnedHandle,
-    path: &Path,
-    identity: FileIdentity,
-) -> io::Result<OwnedHandle> {
-    let reopened =
-        unsafe { ReOpenFile(raw_handle(probe), DIRECTORY_ACCESS, SHARE_ALL, OPEN_FLAGS) };
-    if reopened != INVALID_HANDLE_VALUE {
-        // SAFETY: ReOpenFile returned a new owned handle.
-        return Ok(unsafe { OwnedHandle::from_raw_handle(reopened as RawHandle) });
-    }
-    // Some file systems reject ReOpenFile; fall back to the path and re-check
-    // that it still names the directory originally selected.
+fn open_directory(path: &Path, identity: FileIdentity) -> io::Result<OwnedHandle> {
     let file = open_path(path, DIRECTORY_ACCESS)?;
     let attributes: FILE_ATTRIBUTE_TAG_INFO = get_info(raw_handle(&file), FileAttributeTagInfo)?;
     if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
     {
-        return Err(io::Error::other("扫描根目录在打开前已被替换，请重新选择。"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "请选择真实目录；不跟随符号链接或目录联接。",
+        ));
     }
     if identity_valid(identity) {
         let current = get_info::<FILE_ID_INFO>(raw_handle(&file), FileIdInfo)
@@ -470,6 +430,27 @@ fn reopen_for_listing(
         }
     }
     Ok(file)
+}
+
+fn duplicate_handle(handle: &OwnedHandle) -> io::Result<OwnedHandle> {
+    let process = unsafe { GetCurrentProcess() };
+    let mut duplicate: HANDLE = ptr::null_mut();
+    let ok = unsafe {
+        DuplicateHandle(
+            process,
+            raw_handle(handle),
+            process,
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: DuplicateHandle returned a new owned handle.
+    Ok(unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) })
 }
 
 fn unsupported_directory_class(error: &io::Error) -> bool {
@@ -569,6 +550,26 @@ fn probe_link_count(parent: HANDLE, name: &OsStr) -> io::Result<u64> {
     )?;
     let standard: FILE_STANDARD_INFO = get_info(raw_handle(&child), FileStandardInfo)?;
     Ok(u64::from(standard.NumberOfLinks.max(1)))
+}
+
+/// Whether the filesystem can enumerate `FILE_ID_EXTD_DIR_INFO`. Wine and
+/// FAT-style stacks reject it; the scan then uses the fallback layout, which
+/// does not provide identities.
+#[cfg(test)]
+pub fn extended_directory_ids_supported(path: &Path) -> bool {
+    let Ok(handle) = open_path(path, DIRECTORY_ACCESS) else {
+        return false;
+    };
+    let mut buffer = vec![0_u64; 4096 / size_of::<u64>()];
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            raw_handle(&handle),
+            FileIdExtdDirectoryRestartInfo,
+            buffer.as_mut_ptr().cast(),
+            size_of_val(buffer.as_slice()) as u32,
+        )
+    };
+    result != 0 || io::Error::last_os_error().raw_os_error() == Some(ERROR_NO_MORE_FILES as i32)
 }
 
 /// Allocation reported by the filesystem for one path. Used by tests to
@@ -787,7 +788,13 @@ mod tests {
             .unwrap();
         let handle = open_path(&child, FILE_ACCESS).unwrap();
         let info: FILE_ID_INFO = get_info(raw_handle(&handle), FileIdInfo).unwrap();
-        assert_eq!(entry.metadata.identity, identity_from(&info));
+        if extended_directory_ids_supported(&root) {
+            assert_eq!(entry.metadata.identity, identity_from(&info));
+        } else {
+            // The fallback record has no 128-bit ID, so the directory must
+            // opt out of identity-based merging instead of using a guess.
+            assert_eq!(entry.metadata.identity, INVALID_IDENTITY);
+        }
         assert_eq!(entry.metadata.kind, EntryKind::Directory);
         std::fs::remove_dir_all(&root).ok();
     }

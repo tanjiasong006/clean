@@ -141,6 +141,17 @@ fn mark_sparse(file: &fs::File) -> bool {
 }
 
 #[cfg(unix)]
+fn extended_ids_supported() -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn extended_ids_supported() -> bool {
+    let probe = TempDirectory::new();
+    crate::platform::scan_fs::windows_extended_directory_ids(&probe.0)
+}
+
+#[cfg(unix)]
 fn symlinks_supported() -> bool {
     true
 }
@@ -446,6 +457,9 @@ fn worker_delivers_bounded_batches_and_flushes_on_cancellation() {
 
 #[test]
 fn queued_directory_replacements_are_incomplete_and_never_read() {
+    if !extended_ids_supported() {
+        return;
+    }
     for replace_with_symlink in [false, true] {
         if replace_with_symlink && !symlinks_supported() {
             continue;
@@ -661,6 +675,10 @@ fn receiver_disconnection_stops_traversal_immediately() {
 #[test]
 fn sparse_files_keep_only_written_blocks_and_their_exact_path() {
     let temp = TempDirectory::new();
+    // Windows forbids control characters in names; macOS allows the newline.
+    #[cfg(windows)]
+    let path = temp.0.join("Unicode 空格 'quotes'.bin");
+    #[cfg(not(windows))]
     let path = temp.0.join("Unicode 空格 'quotes'\n.bin");
     use std::io::{Seek, SeekFrom, Write};
     let mut file = fs::File::create(&path).unwrap();
@@ -844,6 +862,9 @@ fn matching_inodes_on_different_devices_are_not_deduplicated() {
 
 #[test]
 fn cancelling_after_a_hard_link_preserves_only_one_allocation() {
+    if !extended_ids_supported() {
+        return;
+    }
     let temp = TempDirectory::new();
     let original = temp.file("original", 37);
     fs::hard_link(&original, temp.0.join("alias")).unwrap();
@@ -877,6 +898,9 @@ fn cancelling_after_a_hard_link_preserves_only_one_allocation() {
 
 #[test]
 fn hard_link_deduplication_survives_worker_batch_boundaries() {
+    if !extended_ids_supported() {
+        return;
+    }
     use crate::analysis::{DirectoryIndex, LargeFileIndex};
     let temp = TempDirectory::new();
     let original = temp.file("original", 37);

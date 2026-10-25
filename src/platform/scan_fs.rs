@@ -21,6 +21,8 @@ pub use windows::RootFileSystem;
 #[cfg(all(target_os = "windows", test))]
 pub use windows::allocated_bytes as windows_allocated_bytes;
 #[cfg(all(target_os = "windows", test))]
+pub use windows::extended_directory_ids_supported as windows_extended_directory_ids;
+#[cfg(all(target_os = "windows", test))]
 pub use windows::link_count as windows_link_count;
 #[cfg(all(target_os = "windows", test))]
 pub use windows::mark_sparse as windows_mark_sparse;
