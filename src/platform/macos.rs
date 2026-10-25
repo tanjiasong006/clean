@@ -45,7 +45,7 @@ fn reveal_command(path: &Path) -> io::Result<Command> {
     Ok(command)
 }
 
-pub fn reveal_in_finder(path: &Path) -> io::Result<()> {
+pub fn reveal_item(path: &Path) -> io::Result<()> {
     let mut command = reveal_command(path)?;
     std::fs::symlink_metadata(path)?;
     let output = command.output()?;
@@ -103,6 +103,6 @@ mod tests {
 
     #[test]
     fn missing_finder_target_returns_error_before_launch() {
-        assert!(reveal_in_finder(Path::new("/dev/null/not-a-file")).is_err());
+        assert!(reveal_item(Path::new("/dev/null/not-a-file")).is_err());
     }
 }

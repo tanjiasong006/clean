@@ -616,12 +616,12 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { platform::reveal_in_finder(&path) })
+                .spawn(async move { platform::reveal_item(&path) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.revealing = false;
                 if let Err(error) = result {
-                    this.notice = Some(format!("无法在 Finder 中定位：{error}"));
+                    this.notice = Some(platform::reveal_error(error));
                 }
                 cx.notify();
             });
@@ -808,7 +808,7 @@ impl AppView {
         let has_scan = self.scan_root.is_some();
         let scanning = self.results.state == ScanState::Scanning;
         let home = platform::home_directory();
-        let downloads = home.as_ref().map(|home| home.join("Downloads"));
+        let downloads = platform::downloads_directory();
         let scanning_home = home.is_some() && self.scan_root == home;
         let scanning_downloads = downloads.is_some() && self.scan_root == downloads;
         let mut entries = vec![
@@ -1464,7 +1464,7 @@ impl AppView {
                 .with_size(Size::Small)
                 .icon(IconName::FolderSearch)
                 .ghost()
-                .tooltip("在 Finder 中显示所选项目")
+                .tooltip(format!("{}所选项目", platform::reveal_label()))
                 .on_click(cx.listener(|this, _, _, cx| this.reveal_selected(cx))),
             )
             .into_any_element()
@@ -1686,7 +1686,7 @@ impl AppView {
             let reveal = entity.clone();
             let reveal_path = path.clone();
             menu = menu.item(
-                PopupMenuItem::new("在 Finder 中显示")
+                PopupMenuItem::new(platform::reveal_label())
                     .icon(IconName::FolderSearch)
                     .on_click(move |_, _, cx| {
                         let path = reveal_path.clone();
@@ -1739,12 +1739,12 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { platform::reveal_in_finder(&path) })
+                .spawn(async move { platform::reveal_item(&path) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.revealing = false;
                 if let Err(error) = result {
-                    this.notice = Some(format!("无法在 Finder 中定位：{error}"));
+                    this.notice = Some(platform::reveal_error(error));
                 }
                 cx.notify();
             });
@@ -2513,6 +2513,11 @@ impl AppView {
                     details.push(("已计入", self.results.path(owner).display().to_string()));
                 }
 
+                let reveal_label = if self.revealing {
+                    "正在定位…".to_string()
+                } else {
+                    platform::reveal_label()
+                };
                 let primary = match (is_directory, self.page) {
                     (true, _) => Some(
                         button("enter-directory", false, &theme)
@@ -2544,11 +2549,7 @@ impl AppView {
                             .primary()
                             .with_size(Size::Small)
                             .w_full()
-                            .label(if self.revealing {
-                                "正在定位…"
-                            } else {
-                                "在 Finder 中显示"
-                            })
+                            .label(reveal_label)
                             .icon(IconName::FolderSearch)
                             .on_click(cx.listener(|this, _, _, cx| this.reveal_selected(cx)))
                             .into_any_element(),
@@ -2671,7 +2672,7 @@ impl AppView {
                                     if self.revealing {
                                         "正在定位…".into()
                                     } else {
-                                        "在 Finder 中显示".into()
+                                        platform::reveal_label()
                                     },
                                     IconName::FolderSearch,
                                     palette.text_secondary,
@@ -2827,7 +2828,7 @@ impl AppView {
         let theme = cx.theme().clone();
         let palette = Palette::for_theme(&theme);
         let home = platform::home_directory();
-        let downloads = home.as_ref().map(|home| home.join("Downloads"));
+        let downloads = platform::downloads_directory();
         let home_enabled = home.is_some() && !self.choosing;
         let downloads_enabled = downloads.is_some() && !self.choosing;
         v_flex()
@@ -2953,16 +2954,23 @@ impl AppView {
                 .into_any_element()
         };
 
+        let copy = platform::COPY_SHORTCUT;
+        let inspector = platform::INSPECTOR_SHORTCUT;
+        let back = platform::BACK_SHORTCUT;
         let hints = match self.page {
-            Page::Directory if directory_selected => "Enter 进入 · ⌫ 返回 · ⌘C 复制",
-            Page::Directory if selected.is_none() => "↑↓ 选择 · Enter 进入",
-            Page::Directory => "⌫ 返回 · ⌘C 复制 · ⌘I 详情",
-            Page::Overview if directory_selected => "Enter 进入 · ⌘C 复制 · ⌘I 详情",
-            Page::Overview if selected.is_none() => "↑↓ 选择 · Enter 进入",
-            Page::Overview => "⌘C 复制 · ⌘I 详情",
-            Page::LargeFiles if selected.is_none() => "↑↓ 选择 · Enter 所在目录",
-            Page::LargeFiles => "Enter 所在目录 · ⌘C 复制路径",
-            Page::Issues => "",
+            Page::Directory if directory_selected => {
+                format!("Enter 进入 · {back} 返回 · {copy} 复制")
+            }
+            Page::Directory if selected.is_none() => "↑↓ 选择 · Enter 进入".into(),
+            Page::Directory => format!("{back} 返回 · {copy} 复制 · {inspector} 详情"),
+            Page::Overview if directory_selected => {
+                format!("Enter 进入 · {copy} 复制 · {inspector} 详情")
+            }
+            Page::Overview if selected.is_none() => "↑↓ 选择 · Enter 进入".into(),
+            Page::Overview => format!("{copy} 复制 · {inspector} 详情"),
+            Page::LargeFiles if selected.is_none() => "↑↓ 选择 · Enter 所在目录".into(),
+            Page::LargeFiles => format!("Enter 所在目录 · {copy} 复制路径"),
+            Page::Issues => String::new(),
         };
 
         h_flex()
