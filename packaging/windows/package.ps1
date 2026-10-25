@@ -33,6 +33,7 @@ while ($parts.Count -lt 4) { $parts += '0' }
 $version4 = $parts[0..3] -join '.'
 
 $binaryPath = (Resolve-Path $Binary).Path
+$iconPath = (Resolve-Path "packaging\icons\clean.ico").Path
 $scriptPath = (Resolve-Path "packaging\windows\clean.nsi").Path
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $outPath = Join-Path (Resolve-Path $OutDir).Path "Clean-${Version}-windows-x86_64-setup.exe"
@@ -41,6 +42,7 @@ $outPath = Join-Path (Resolve-Path $OutDir).Path "Clean-${Version}-windows-x86_6
     "/DAPP_VERSION=$Version" `
     "/DAPP_VERSION_4=$version4" `
     "/DAPP_BINARY=$binaryPath" `
+    "/DAPP_ICON=$iconPath" `
     "/DAPP_OUT_FILE=$outPath" `
     $scriptPath
 if ($LASTEXITCODE -ne 0) {

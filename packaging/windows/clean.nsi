@@ -2,8 +2,12 @@ Unicode true
 
 !include "MUI2.nsh"
 
-!define MUI_ICON "${__FILEDIR__}/../icons/clean.ico"
-!define MUI_UNICON "${__FILEDIR__}/../icons/clean.ico"
+!ifndef APP_ICON
+  !define APP_ICON "${__FILEDIR__}\..\icons\clean.ico"
+!endif
+
+!define MUI_ICON "${APP_ICON}"
+!define MUI_UNICON "${APP_ICON}"
 
 !ifndef APP_VERSION
   !define APP_VERSION "0.0.0"
@@ -12,10 +16,10 @@ Unicode true
   !define APP_VERSION_4 "0.0.0.0"
 !endif
 !ifndef APP_BINARY
-  !define APP_BINARY "${__FILEDIR__}/../../target/release/clean.exe"
+  !define APP_BINARY "${__FILEDIR__}\..\..\target\release\clean.exe"
 !endif
 !ifndef APP_OUT_FILE
-  !define APP_OUT_FILE "${__FILEDIR__}/../../dist/Clean-${APP_VERSION}-windows-x86_64-setup.exe"
+  !define APP_OUT_FILE "${__FILEDIR__}\..\..\dist\Clean-${APP_VERSION}-windows-x86_64-setup.exe"
 !endif
 
 !define APP_NAME "Clean"
@@ -44,7 +48,7 @@ VIAddVersionKey /LANG=1033 "ProductVersion" "${APP_VERSION}"
 Section "Install"
   SetOutPath "$INSTDIR"
   File "${APP_BINARY}"
-  File "${__FILEDIR__}/../icons/clean.ico"
+  File "${APP_ICON}"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   WriteRegStr HKCU "Software\Clean" "InstallDir" "$INSTDIR"
