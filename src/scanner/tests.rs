@@ -689,6 +689,9 @@ fn sparse_files_keep_only_written_blocks_and_their_exact_path() {
     file.write_all(&[1; 4096]).unwrap();
     file.seek(SeekFrom::End(-4096)).unwrap();
     file.write_all(&[2; 4096]).unwrap();
+    // NTFS reports the allocation of dirty cached pages as zero until they
+    // are flushed, so make the size deterministic before scanning.
+    file.sync_all().unwrap();
     let results = collect_real(&temp.0);
     assert_eq!(results.state, ScanState::Complete);
     assert_eq!(results.files, 1);
