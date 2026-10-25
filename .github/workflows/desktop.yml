@@ -3,6 +3,7 @@ name: Desktop checks
 on:
   push:
     branches: [main]
+    tags: ["**"]
   pull_request:
 
 permissions:
@@ -31,6 +32,20 @@ jobs:
           "$RUNNER_TEMP/clean-core-perf"
       - name: Build
         run: cargo build --locked
+      - name: Build release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: cargo build --locked --release
+      - name: Package release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          packaging/macos/package.sh "${GITHUB_REF_NAME#v}" target/release/clean dist
+      - name: Upload release artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: Clean-${{ github.ref_name }}-macos-${{ runner.arch }}
+          path: dist/Clean-*-macos-*.dmg
+          if-no-files-found: error
 
   windows:
     runs-on: windows-latest
@@ -56,3 +71,18 @@ jobs:
         run: |
           cargo build --locked
           cargo build --locked --release
+      - name: Package release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) {
+            choco install nsis --yes --no-progress
+          }
+          ./packaging/windows/package.ps1 -Version ("${{ github.ref_name }}" -replace '^v', '')
+      - name: Upload release artifact
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: Clean-${{ github.ref_name }}-windows-x86_64-setup
+          path: dist/Clean-*-windows-x86_64-setup.exe
+          if-no-files-found: error

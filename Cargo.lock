@@ -833,6 +833,7 @@ dependencies = [
 name = "clean"
 version = "0.1.0"
 dependencies = [
+ "embed-resource",
  "gpui-kit",
  "libc",
  "rustix",

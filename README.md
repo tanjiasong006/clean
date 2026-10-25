@@ -72,7 +72,27 @@ wine target/x86_64-pc-windows-msvc/debug/deps/clean-<hash>.exe
 
 Wine 未实现 `FileIdExtdDirectoryInfo`，目录枚举会走回退布局，依赖文件身份的硬链接去重与替换检测用例会自动跳过；Wine 的 DXGI/DirectX 也无法初始化，不能用于界面验证。因此 Wine 只能补充扫描后端的回归检查，最终以 Windows 实机或 Windows CI 为准。
 
+交叉构建的 debug 版在 Windows 上启动还需要着色器源文件：debug 版在运行时用 `D3DCompileFromFile` 编译 HLSL，而 gpui-pre-windows 把**构建机**上的 `CARGO_MANIFEST_DIR` 写进了可执行文件，目标机上该路径不存在时以 `os error 3`（找不到路径）失败。要在目标机运行这类 debug 构建，需按该路径放置 `shaders.hlsl`、`color_text_raster.hlsl` 和 `alpha_correction.hlsl`；`target/windows-debug-shaders/gpui-pre-windows-<版本>/src/` 保留了一份按相同布局整理的文件。release 构建在编译期把着色器字节码嵌入二进制，不依赖这些文件。
+
 首次构建会下载并编译 GPUI 依赖，耗时较长。扫描器的临时目录测试覆盖目录聚合、排序、符号链接、硬链接、取消、读取失败、扫描期间文件变化和后台批量更新。权限失败通过文件系统边界注入，以便测试在不同权限的环境中均可重复执行。额外覆盖目录及祖先目录被替换为符号链接、目录身份变化、打开目录后的路径替换、开始前/迭代期间取消、接收端断开、通道背压、160 层目录、稀疏大文件与特殊名称。批量聚合以逐事件参考算法校验不同批次边界，并测试统计溢出。额外测试覆盖大文件筛选边界、增量索引、视图切换与目录导航状态、卷容量换算，以及 Finder 命令的字面路径参数（不启动 Finder）。Windows 条目解析、两种目录记录布局和重解析点分类放在纯 Rust 模块中，可在任意主机运行测试；真实文件系统用例在 Windows CI 上执行，创建符号链接需要开发者模式或相应权限，权限不足时跳过相关用例。
+
+## 安装包
+
+本地构建安装包（先执行 `cargo build --locked --release`）：
+
+```sh
+packaging/macos/package.sh 0.1.0 target/release/clean dist
+```
+
+生成 `dist/Clean-0.1.0-macos-<架构>.dmg`，内含 `Clean.app` 和指向 `/Applications` 的快捷方式。应用使用 ad-hoc 签名、未公证，首次打开需右键选择“打开”。
+
+```powershell
+powershell -File packaging\windows\package.ps1 -Version 0.1.0
+```
+
+生成 `dist\Clean-0.1.0-windows-x86_64-setup.exe`，需要 NSIS 的 `makensis.exe`。安装包按当前用户安装到 `%LOCALAPPDATA%\Programs\Clean`，创建开始菜单快捷方式并注册卸载项，不需要管理员权限。安装包和 exe 未做代码签名，Windows SmartScreen 可能提示。Windows release 通过 `.cargo/config.toml` 使用静态 CRT，不依赖 VC++ 运行库。
+
+图标源文件为 `packaging/icons/clean.svg`，生成的 `clean.icns` 用于 macOS 应用包，`clean.ico` 由 `build.rs` 通过 `embed-resource` 嵌入 Windows exe（资源 ID 为 1，GPUI 据此设置窗口图标），同时随安装包安装供快捷方式使用。在 macOS 上交叉构建 Windows 版本时，需把 Homebrew LLVM 的 `llvm-rc` 加入 `PATH` 才会嵌入图标；找不到时跳过嵌入，构建仍然成功。
 
 ## 项目结构
 
@@ -143,4 +163,4 @@ CLEAN_BENCH_ROOT="$HOME" CLEAN_BENCH_ROUNDS=3 \
 
 主分支使用 `main`，提交 `Cargo.lock` 以固定应用依赖。构建产物、日志及本地环境配置由 `.gitignore` 排除；`.gitattributes` 统一文本换行。
 
-macOS 与 Windows CI 对主分支推送和拉取请求执行格式、Clippy、测试及构建检查。
+macOS 与 Windows CI 对主分支推送和拉取请求执行格式、Clippy、测试及构建检查。推送任意 tag 时，两个任务在检查通过后还会各自构建 release 并上传安装包 artifact：macOS 为 `Clean-<版本>-macos-<架构>.dmg`（ad-hoc 签名，未公证），Windows 为 `Clean-<版本>-windows-x86_64-setup.exe`。
