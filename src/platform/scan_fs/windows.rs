@@ -46,6 +46,7 @@ use super::windows_records::RECORD_HEADER_SIZE;
 use super::windows_records::parse;
 use super::{DirEntry, Directory, EntryError, EntryItem, EntryMetadata, FileIdentity, FileSystem};
 use crate::models::EntryKind;
+use crate::platform::volume_root;
 
 const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const FILE_ACCESS: u32 = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
@@ -280,7 +281,7 @@ impl Entries<'_> {
                 raw_handle(&self.directory.handle),
                 class,
                 self.buffer.as_mut_ptr().cast(),
-                size_of_val(&self.buffer) as u32,
+                size_of_val(self.buffer.as_slice()) as u32,
             )
         };
         if result != 0 {
@@ -497,21 +498,6 @@ fn volume_filesystem(path: &Path) -> Option<String> {
         .position(|&unit| unit == 0)
         .unwrap_or(name.len());
     Some(String::from_utf16_lossy(&name[..length]))
-}
-
-fn volume_root(path: &Path) -> PathBuf {
-    let mut root = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) => root.push(component.as_os_str()),
-            Component::RootDir => {
-                root.push(component.as_os_str());
-                break;
-            }
-            _ => break,
-        }
-    }
-    root
 }
 
 fn verbatim_path(path: &Path) -> io::Result<Vec<u16>> {

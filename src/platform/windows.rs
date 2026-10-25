@@ -109,7 +109,7 @@ fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
     (!path.as_os_str().is_empty()).then_some(path)
 }
 
-fn volume_root(path: &Path) -> PathBuf {
+pub(crate) fn volume_root(path: &Path) -> PathBuf {
     let mut components = path.components();
     if let Some(Component::Prefix(prefix)) = components.next() {
         match prefix.kind() {

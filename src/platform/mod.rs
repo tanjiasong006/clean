@@ -12,6 +12,8 @@ pub use macos::{appearance_preference_path, disk_space, reveal_item};
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
+pub(crate) use windows::volume_root;
+#[cfg(target_os = "windows")]
 pub use windows::{appearance_preference_path, disk_space, downloads_directory, reveal_item};
 
 #[cfg(target_os = "macos")]
