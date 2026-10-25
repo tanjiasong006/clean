@@ -53,4 +53,6 @@ jobs:
           rustc --edition=2024 -D warnings -O scripts/core_perf.rs -o "$env:RUNNER_TEMP/clean-core-perf.exe"
           & "$env:RUNNER_TEMP/clean-core-perf.exe"
       - name: Build
-        run: cargo build --locked
+        run: |
+          cargo build --locked
+          cargo build --locked --release
