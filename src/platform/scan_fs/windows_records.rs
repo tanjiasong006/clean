@@ -14,6 +14,8 @@ pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 /// Offset of the variable-length `FileName` field on 64-bit Windows.
 pub const RECORD_HEADER_SIZE: usize = 88;
+/// Same offset for `FILE_ID_BOTH_DIR_INFO`, the fallback record.
+pub const BOTH_RECORD_HEADER_SIZE: usize = 120;
 
 const NEXT_ENTRY_OFFSET: usize = 0;
 const ALLOCATION_SIZE: usize = 48;
@@ -21,6 +23,19 @@ const ATTRIBUTES: usize = 56;
 const FILE_NAME_LENGTH: usize = 60;
 const REPARSE_POINT_TAG: usize = 68;
 const FILE_ID: usize = 72;
+
+const BOTH_ALLOCATION_SIZE: usize = 64;
+const BOTH_ATTRIBUTES: usize = 72;
+const BOTH_FILE_NAME_LENGTH: usize = 76;
+
+pub struct BothRecord {
+    pub next_offset: usize,
+    pub name_units: Vec<u16>,
+    pub allocation: i64,
+    pub attributes: u32,
+    pub reparse: bool,
+    pub is_dot: bool,
+}
 
 pub struct Record {
     /// Byte offset to the next record, or zero for the last record in a batch.
@@ -55,7 +70,10 @@ pub fn parse(buffer: &[u8], start: usize) -> io::Result<Record> {
         .checked_add(name_length)
         .filter(|&end| end <= buffer.len())
         .ok_or_else(|| malformed("目录条目名称超出缓冲区。"))?;
-    if next_offset != 0 && (next_offset < RECORD_HEADER_SIZE || start + next_offset > buffer.len())
+    if next_offset != 0
+        && (next_offset < RECORD_HEADER_SIZE
+            || start + next_offset > buffer.len()
+            || text_end > start + next_offset)
     {
         return Err(malformed("目录条目偏移超出缓冲区。"));
     }
@@ -71,6 +89,46 @@ pub fn parse(buffer: &[u8], start: usize) -> io::Result<Record> {
         kind: classify(attributes, reparse_tag),
         allocation,
         file_id,
+        is_dot,
+    })
+}
+
+/// Parses one `FILE_ID_BOTH_DIR_INFO` record. This structure lacks a reparse
+/// tag, so the caller may refine the kind for reparse entries.
+pub fn parse_both(buffer: &[u8], start: usize) -> io::Result<BothRecord> {
+    let text_start = start
+        .checked_add(BOTH_RECORD_HEADER_SIZE)
+        .filter(|&end| end <= buffer.len())
+        .ok_or_else(|| malformed("目录条目缓冲区被截断。"))?;
+    let next_offset = u32_at(buffer, start + NEXT_ENTRY_OFFSET)? as usize;
+    let allocation = i64_at(buffer, start + BOTH_ALLOCATION_SIZE)?;
+    let attributes = u32_at(buffer, start + BOTH_ATTRIBUTES)?;
+    let name_length = u32_at(buffer, start + BOTH_FILE_NAME_LENGTH)? as usize;
+    if !name_length.is_multiple_of(2) {
+        return Err(malformed("目录条目名称长度不是偶数。"));
+    }
+    let text_end = text_start
+        .checked_add(name_length)
+        .filter(|&end| end <= buffer.len())
+        .ok_or_else(|| malformed("目录条目名称超出缓冲区。"))?;
+    if next_offset != 0
+        && (next_offset < BOTH_RECORD_HEADER_SIZE
+            || start + next_offset > buffer.len()
+            || text_end > start + next_offset)
+    {
+        return Err(malformed("目录条目偏移超出缓冲区。"));
+    }
+    let name_units = buffer[text_start..text_end]
+        .chunks_exact(2)
+        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    let is_dot = name_units == [b'.' as u16] || name_units == [b'.' as u16, b'.' as u16];
+    Ok(BothRecord {
+        next_offset,
+        name_units,
+        allocation,
+        attributes,
+        reparse: attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
         is_dot,
     })
 }
@@ -223,6 +281,52 @@ mod tests {
         assert_eq!(two.name_units, [0x62]);
         assert_eq!(two.allocation, 200);
         assert_eq!(two.next_offset, 0);
+    }
+
+    #[test]
+    fn rejects_names_that_overlap_the_next_record() {
+        let mut chained = record(&[0x61], 0, 0, 0, 96);
+        chained.extend_from_slice(&record(&[0x62], 0, 0, 0, 0));
+        chained[FILE_NAME_LENGTH..FILE_NAME_LENGTH + 4].copy_from_slice(&16_u32.to_ne_bytes());
+        assert!(parse(&chained, 0).is_err());
+    }
+
+    fn both_record(name: &[u16], attributes: u32, allocation: i64, next: usize) -> Vec<u8> {
+        let name_bytes = name.len() * 2;
+        let mut buffer = vec![0_u8; BOTH_RECORD_HEADER_SIZE + name_bytes];
+        buffer[NEXT_ENTRY_OFFSET..NEXT_ENTRY_OFFSET + 4]
+            .copy_from_slice(&(next as u32).to_ne_bytes());
+        buffer[BOTH_ALLOCATION_SIZE..BOTH_ALLOCATION_SIZE + 8]
+            .copy_from_slice(&allocation.to_ne_bytes());
+        buffer[BOTH_ATTRIBUTES..BOTH_ATTRIBUTES + 4].copy_from_slice(&attributes.to_ne_bytes());
+        buffer[BOTH_FILE_NAME_LENGTH..BOTH_FILE_NAME_LENGTH + 4]
+            .copy_from_slice(&(name_bytes as u32).to_ne_bytes());
+        for (index, unit) in name.iter().enumerate() {
+            let at = BOTH_RECORD_HEADER_SIZE + index * 2;
+            buffer[at..at + 2].copy_from_slice(&unit.to_ne_bytes());
+        }
+        buffer
+    }
+
+    #[test]
+    fn parses_the_fallback_record_layout() {
+        let name: Vec<u16> = "fallback".encode_utf16().collect();
+        let buffer = both_record(&name, FILE_ATTRIBUTE_DIRECTORY, 512, 0);
+        let parsed = parse_both(&buffer, 0).unwrap();
+        assert_eq!(parsed.name_units, name);
+        assert_eq!(parsed.allocation, 512);
+        assert!(!parsed.reparse);
+        assert!(!parsed.is_dot);
+        assert_eq!(parsed.next_offset, 0);
+        assert_eq!(classify(parsed.attributes, 0), EntryKind::Directory);
+
+        let reparse = both_record(&[0x61], FILE_ATTRIBUTE_REPARSE_POINT, 0, 0);
+        let parsed = parse_both(&reparse, 0).unwrap();
+        assert!(parsed.reparse);
+        assert_eq!(
+            classify(parsed.attributes, IO_REPARSE_TAG_SYMLINK),
+            EntryKind::Symlink
+        );
     }
 
     #[test]
