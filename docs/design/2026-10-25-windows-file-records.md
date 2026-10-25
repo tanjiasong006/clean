@@ -163,13 +163,13 @@ NTFS 对目录报告的 AllocationSize 通常为 0。接受文件系统返回值
 
 - **D1**：已按平台拆分 `FileIdentity`，两端均提供 `new` 构造函数；macOS 键仍为 16 字节。
 - **D2**：已实现方案 A。`NtCreateFile` 相对父句柄打开每个有有效身份的文件，`GetFileInformationByHandleEx(FileStandardInfo)` 读取 `NumberOfLinks`；探测失败按 1 处理。100 万文件基准尚未在 Windows 实机执行，暂不触发方案 B 的切换门槛。
-- **D3**：仅本地 `NTFS` 与 `ReFS` 启用文件 ID 去重；`GetDriveTypeW` 报告为 `DRIVE_REMOTE` 的卷（含 UNC 共享）、其他文件系统、卷序列号为 0 或 FileId 全零时 `links = 1`，不合并文件。FAT/exFAT 未使用路径哈希伪造身份。
+- **D3**：仅本地 `NTFS` 与 `ReFS` 启用文件 ID 去重；`GetDriveTypeW` 报告为 `DRIVE_REMOTE` 的卷（含 UNC 共享）、其他文件系统、卷序列号为 0 或 FileId 全零时 `links = 1`，不合并文件。FAT/exFAT 未使用路径哈希伪造身份。文件系统类型、远程属性和容量都按 `GetVolumePathNameW` 解析出的卷挂载点查询，挂载到文件夹的卷不会误用宿主盘符的信息。
 - **D4**：目录重解析点一律不遍历；符号链接与目录联接记为 `Symlink`，其他目录标签记为 `Other`；文件符号链接记为 `Symlink`，其他文件重解析标签（含云占位符）按 `File` 计入分配量。Windows 首版不跨卷。
 - **D5**：接受 `FILE_ID_EXTD_DIR_INFO.AllocationSize`，NTFS 目录通常为 0。
 - **D6**：已实现 WTF-8 编解码，含孤立代理项与 255 单元长名往返测试；展示仍可 lossy。
 - **D7**：方案 A 未改变内存模型；Windows 实机峰值未测。
 - **枚举 API 偏差**：条目枚举使用 `GetFileInformationByHandleEx(FileIdExtdDirectoryInfo / FileIdExtdDirectoryRestartInfo)`，而非 `NtQueryDirectoryFile`。两者读取同一个信息类，前者是 Win32 封装且减少 NTSTATUS 处理；目录打开仍使用 `NtCreateFile`。
-- **枚举回退**：首次读取若返回 `ERROR_INVALID_FUNCTION`、`ERROR_NOT_SUPPORTED` 或 `ERROR_INVALID_PARAMETER`，从目录开头改用 `FileIdBothDirectoryInfo / FileIdBothDirectoryRestartInfo` 重读。该布局无 128 位 ID 与重解析标签：条目 `links = 1`、不参与去重，仅重解析点条目额外按名称打开读取标签。回退按目录独立生效。
+- **枚举回退**：首次读取若返回 `ERROR_INVALID_FUNCTION`、`ERROR_INVALID_LEVEL`、`ERROR_NOT_SUPPORTED` 或 `ERROR_INVALID_PARAMETER`，从目录开头改用 `FileIdBothDirectoryInfo / FileIdBothDirectoryRestartInfo` 重读。该布局无 128 位 ID 与重解析标签：条目 `links = 1`、不参与去重，仅重解析点条目额外按名称打开读取标签。回退按目录独立生效。缓冲区为 64 KiB（单条记录最大约 0.6 KiB），避免部分 SMB 服务器对更大缓冲区的拒绝。`FILE_ID_BOTH_DIR_INFO` 的 64 位布局为：`AllocationSize` 48、`FileAttributes` 56、`FileNameLength` 60、`FileName` 104；Windows 测试用 `offset_of!` 与 `windows-sys` 定义比对。
 - **根目录校验与重开**：先用 `FILE_READ_ATTRIBUTES` 打开并拒绝非目录与重解析点，再以列目录权限 `ReOpenFile`；不支持的卷按原路径重开，并重新校验目录属性与 FileId。失败时返回路径重开的真实错误，而不是 `ReOpenFile` 的错误。
 - **测试与 CI**：纯缓冲区解析和重解析点分类抽到平台无关模块，可在任意主机运行；Windows job 执行 fmt、Clippy、test、build 与 core_perf。真实文件系统用例在 Windows CI 上运行，符号链接用例在权限不足时跳过。
 
