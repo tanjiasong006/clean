@@ -4,6 +4,9 @@
 //!      /tmp/clean-core-perf --memory 3000000
 #![allow(dead_code)]
 
+// The crate build uses every re-export; this standalone harness only needs
+// the indexes.
+#[allow(unused_imports)]
 #[path = "../src/analysis/mod.rs"]
 mod analysis;
 #[path = "../src/models/mod.rs"]
