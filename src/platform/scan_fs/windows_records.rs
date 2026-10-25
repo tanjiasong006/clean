@@ -14,8 +14,9 @@ pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 /// Offset of the variable-length `FileName` field on 64-bit Windows.
 pub const RECORD_HEADER_SIZE: usize = 88;
-/// Same offset for `FILE_ID_BOTH_DIR_INFO`, the fallback record.
-pub const BOTH_RECORD_HEADER_SIZE: usize = 120;
+/// Offset of `FileName` in `FILE_ID_BOTH_DIR_INFO`, the fallback record. Its
+/// header is shorter than the extended structure's: it ends at 104 bytes.
+pub const BOTH_RECORD_HEADER_SIZE: usize = 104;
 
 const NEXT_ENTRY_OFFSET: usize = 0;
 const ALLOCATION_SIZE: usize = 48;
@@ -24,9 +25,9 @@ const FILE_NAME_LENGTH: usize = 60;
 const REPARSE_POINT_TAG: usize = 68;
 const FILE_ID: usize = 72;
 
-const BOTH_ALLOCATION_SIZE: usize = 64;
-const BOTH_ATTRIBUTES: usize = 72;
-const BOTH_FILE_NAME_LENGTH: usize = 76;
+pub const BOTH_ALLOCATION_SIZE: usize = 48;
+pub const BOTH_ATTRIBUTES: usize = 56;
+pub const BOTH_FILE_NAME_LENGTH: usize = 60;
 
 pub struct BothRecord {
     pub next_offset: usize,
