@@ -163,4 +163,4 @@ CLEAN_BENCH_ROOT="$HOME" CLEAN_BENCH_ROUNDS=3 \
 
 主分支使用 `main`，提交 `Cargo.lock` 以固定应用依赖。构建产物、日志及本地环境配置由 `.gitignore` 排除；`.gitattributes` 统一文本换行。
 
-macOS 与 Windows CI 对主分支推送和拉取请求执行格式、Clippy、测试及构建检查。推送任意 tag 时，两个任务在检查通过后各自构建 release 并上传安装包：macOS 为 `Clean-<版本>-macos-<架构>.dmg`（ad-hoc 签名，未公证），Windows 为 `Clean-<版本>-windows-x86_64-setup.exe`。两者都成功后，`release` 任务会自动创建同名 GitHub Release、附上两个安装包并生成更新说明。
+macOS 与 Windows CI 对拉取请求执行格式、Clippy、测试及构建检查，主分支推送不触发 CI。推送任意 tag 时，两个任务同样执行这些检查，随后各自构建 release 并上传安装包：macOS 为 `Clean-<版本>-macos-<架构>.dmg`（ad-hoc 签名，未公证），Windows 为 `Clean-<版本>-windows-x86_64-setup.exe`。两者都成功后，`release` 任务会自动创建同名 GitHub Release、附上两个安装包并生成更新说明。
