@@ -24,7 +24,8 @@ use windows_sys::{
     },
     Win32::{
         Foundation::{
-            ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_ACCESS_DENIED,
+            ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
+            ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_ACCESS_DENIED,
             STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
             STATUS_SHARING_VIOLATION, UNICODE_STRING,
         },
@@ -33,7 +34,8 @@ use windows_sys::{
             FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
             FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
             FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-            FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo,
+            FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdExtdDirectoryInfo,
+            FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetDriveTypeW,
             GetFileInformationByHandleEx, GetVolumeInformationW, OPEN_EXISTING, ReOpenFile,
             SYNCHRONIZE,
         },
@@ -43,7 +45,7 @@ use windows_sys::{
 
 #[cfg(test)]
 use super::windows_records::RECORD_HEADER_SIZE;
-use super::windows_records::parse;
+use super::windows_records::{classify, parse, parse_both};
 use super::{DirEntry, Directory, EntryError, EntryItem, EntryMetadata, FileIdentity, FileSystem};
 use crate::models::EntryKind;
 use crate::platform::volume_root;
@@ -56,6 +58,10 @@ const OPEN_FLAGS: u32 = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POIN
 /// Bulk reads amortize one syscall over many entries. A single entry is at most
 /// the 88-byte header plus a 255-unit name, so 256 KiB never splits one.
 const BUFFER_SIZE: usize = 256 * 1024;
+
+/// `DRIVE_REMOTE` from `winbase.h`; `GetDriveTypeW` reports it for both mapped
+/// drives and UNC shares.
+const DRIVE_REMOTE: u32 = 4;
 
 /// `FSCTL_SET_SPARSE` from `winioctl.h`; marking a file sparse before
 /// extending it keeps tests from allocating their full logical length.
@@ -74,9 +80,12 @@ impl RootFileSystem {
         // `absolute` normalizes `.` and `..` without resolving the final
         // component, so the reparse-point check below still sees a link root.
         let path = std::path::absolute(root)?;
-        let file = open_path(&path, DIRECTORY_ACCESS)?;
+        // Validate with the least access first: a selected regular file then
+        // reports "not a directory" instead of the access error a
+        // directory-only open would produce.
+        let probe = open_path(&path, FILE_ACCESS)?;
         let attributes: FILE_ATTRIBUTE_TAG_INFO =
-            get_info(raw_handle(&file), FileAttributeTagInfo)?;
+            get_info(raw_handle(&probe), FileAttributeTagInfo)?;
         if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -86,23 +95,25 @@ impl RootFileSystem {
         if attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "请选择目录。"));
         }
-        let standard: FILE_STANDARD_INFO = get_info(raw_handle(&file), FileStandardInfo)?;
+        let standard: FILE_STANDARD_INFO = get_info(raw_handle(&probe), FileStandardInfo)?;
         let allocated_bytes = allocation(standard.AllocationSize)?;
 
         // Identity is only meaningful on filesystems that expose stable file
-        // IDs. FAT/exFAT and some network shares report values that must not be
-        // used to merge different files.
+        // IDs. FAT/exFAT, network shares, and volumes with a zero serial must
+        // not be used to merge different files.
         let filesystem = volume_filesystem(&path).unwrap_or_default();
-        let identity = if supports_file_ids(&filesystem) {
-            get_info::<FILE_ID_INFO>(raw_handle(&file), FileIdInfo)
+        let remote = volume_is_remote(&path).unwrap_or(true);
+        let identity = if supports_file_ids(&filesystem) && !remote {
+            get_info::<FILE_ID_INFO>(raw_handle(&probe), FileIdInfo)
                 .map(|info| identity_from(&info))
                 .unwrap_or(INVALID_IDENTITY)
         } else {
             INVALID_IDENTITY
         };
         let volume = identity.volume;
+        let handle = reopen_for_listing(&probe, &path, identity)?;
         Ok(Self {
-            handle: file,
+            handle,
             path,
             metadata: EntryMetadata {
                 kind: EntryKind::Directory,
@@ -138,16 +149,14 @@ impl FileSystem for RootFileSystem {
                 volume: self.volume,
             }));
         }
-        let reopen_error = io::Error::last_os_error();
         // Some file systems reject ReOpenFile; fall back to the path while
         // still verifying that it names the directory originally selected.
-        let file = match open_path(&self.path, DIRECTORY_ACCESS) {
-            Ok(file) => file,
-            Err(_) => return Err(reopen_error),
-        };
+        let file = open_path(&self.path, DIRECTORY_ACCESS)?;
         let attributes: FILE_ATTRIBUTE_TAG_INFO =
             get_info(raw_handle(&file), FileAttributeTagInfo)?;
-        if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        {
             return Err(io::Error::other("扫描根目录在打开前已被替换，请重新选择。"));
         }
         if identity_valid(self.metadata.identity) {
@@ -178,6 +187,7 @@ impl Directory for WinDirectory {
             has_entry: false,
             first_fill: true,
             done: false,
+            format: DirectoryFormat::Extended,
         }))
     }
 
@@ -216,6 +226,15 @@ impl Directory for WinDirectory {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum DirectoryFormat {
+    /// `FILE_ID_EXTD_DIR_INFO`: 128-bit file ID and reparse tag per entry.
+    Extended,
+    /// `FILE_ID_BOTH_DIR_INFO`: older layout without a reparse tag or a
+    /// 128-bit ID, used when the filesystem rejects the extended class.
+    Both,
+}
+
 struct Entries<'a> {
     directory: &'a WinDirectory,
     buffer: Vec<u64>,
@@ -223,6 +242,7 @@ struct Entries<'a> {
     has_entry: bool,
     first_fill: bool,
     done: bool,
+    format: DirectoryFormat,
 }
 
 impl Iterator for Entries<'_> {
@@ -247,12 +267,19 @@ impl Iterator for Entries<'_> {
                 }
             }
             let start = self.cursor;
-            let result = parse_entry(
-                buffer_bytes(&self.buffer),
-                start,
-                raw_handle(&self.directory.handle),
-                self.directory.volume,
-            );
+            let result = match self.format {
+                DirectoryFormat::Extended => parse_entry(
+                    buffer_bytes(&self.buffer),
+                    start,
+                    raw_handle(&self.directory.handle),
+                    self.directory.volume,
+                ),
+                DirectoryFormat::Both => parse_both_entry(
+                    buffer_bytes(&self.buffer),
+                    start,
+                    raw_handle(&self.directory.handle),
+                ),
+            };
             match result {
                 Ok((entry, next)) => {
                     if next == 0 {
@@ -275,12 +302,28 @@ impl Iterator for Entries<'_> {
 
 impl Entries<'_> {
     fn fill(&mut self) -> io::Result<bool> {
-        let class = if self.first_fill {
-            self.first_fill = false;
-            FileIdExtdDirectoryRestartInfo
-        } else {
-            FileIdExtdDirectoryInfo
+        let first = self.first_fill;
+        self.first_fill = false;
+        let class = match (self.format, first) {
+            (DirectoryFormat::Extended, true) => FileIdExtdDirectoryRestartInfo,
+            (DirectoryFormat::Extended, false) => FileIdExtdDirectoryInfo,
+            (DirectoryFormat::Both, true) => FileIdBothDirectoryRestartInfo,
+            (DirectoryFormat::Both, false) => FileIdBothDirectoryInfo,
         };
+        match self.query(class) {
+            Ok(result) => Ok(result),
+            // FAT/exFAT stacks and some SMB servers reject the extended class
+            // outright. The failed first call did not consume enumeration
+            // state, so retry once from the start with the older layout.
+            Err(error) if first && unsupported_directory_class(&error) => {
+                self.format = DirectoryFormat::Both;
+                self.query(FileIdBothDirectoryRestartInfo)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn query(&mut self, class: i32) -> io::Result<bool> {
         let result = unsafe {
             GetFileInformationByHandleEx(
                 raw_handle(&self.directory.handle),
@@ -343,6 +386,107 @@ fn parse_entry(
         }),
         record.next_offset,
     ))
+}
+
+fn parse_both_entry(
+    buffer: &[u8],
+    start: usize,
+    parent: HANDLE,
+) -> io::Result<(Option<DirEntry>, usize)> {
+    let record = parse_both(buffer, start)?;
+    if record.is_dot {
+        return Ok((None, record.next_offset));
+    }
+    let name = OsString::from_wide(&record.name_units);
+    // This layout carries no reparse tag, so only reparse entries cost an
+    // extra open to learn whether they are links or cloud placeholders.
+    let kind = if record.reparse {
+        probe_reparse_tag(parent, &name).map_or_else(
+            || classify(record.attributes, 0),
+            |tag| classify(record.attributes, tag),
+        )
+    } else {
+        classify(record.attributes, 0)
+    };
+    let allocated_bytes = match kind {
+        EntryKind::Directory | EntryKind::File => allocation(record.allocation)?,
+        _ => 0,
+    };
+    Ok((
+        Some(DirEntry {
+            name,
+            metadata: EntryMetadata {
+                kind,
+                allocated_bytes,
+                // No 128-bit ID in this layout, so this directory opts out of
+                // hard-link deduplication rather than guessing an identity.
+                identity: INVALID_IDENTITY,
+                links: 1,
+            },
+        }),
+        record.next_offset,
+    ))
+}
+
+fn probe_reparse_tag(parent: HANDLE, name: &OsStr) -> Option<u32> {
+    let child = nt_open(
+        parent,
+        name,
+        FILE_ACCESS,
+        FILE_OPEN_REPARSE_POINT | FILE_OPEN_NO_RECALL | FILE_SYNCHRONOUS_IO_NONALERT,
+    )
+    .ok()?;
+    let attributes: FILE_ATTRIBUTE_TAG_INFO =
+        get_info(raw_handle(&child), FileAttributeTagInfo).ok()?;
+    Some(attributes.ReparseTag)
+}
+
+fn reopen_for_listing(
+    probe: &OwnedHandle,
+    path: &Path,
+    identity: FileIdentity,
+) -> io::Result<OwnedHandle> {
+    let reopened =
+        unsafe { ReOpenFile(raw_handle(probe), DIRECTORY_ACCESS, SHARE_ALL, OPEN_FLAGS) };
+    if reopened != INVALID_HANDLE_VALUE {
+        // SAFETY: ReOpenFile returned a new owned handle.
+        return Ok(unsafe { OwnedHandle::from_raw_handle(reopened as RawHandle) });
+    }
+    // Some file systems reject ReOpenFile; fall back to the path and re-check
+    // that it still names the directory originally selected.
+    let file = open_path(path, DIRECTORY_ACCESS)?;
+    let attributes: FILE_ATTRIBUTE_TAG_INFO = get_info(raw_handle(&file), FileAttributeTagInfo)?;
+    if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(io::Error::other("扫描根目录在打开前已被替换，请重新选择。"));
+    }
+    if identity_valid(identity) {
+        let current = get_info::<FILE_ID_INFO>(raw_handle(&file), FileIdInfo)
+            .map(|info| identity_from(&info))?;
+        if current != identity {
+            return Err(io::Error::other("扫描根目录在打开前已被替换，请重新选择。"));
+        }
+    }
+    Ok(file)
+}
+
+fn unsupported_directory_class(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_INVALID_FUNCTION as i32
+                || code == ERROR_NOT_SUPPORTED as i32
+                || code == ERROR_INVALID_PARAMETER as i32
+    )
+}
+
+fn volume_is_remote(path: &Path) -> Option<bool> {
+    let root = volume_root(path);
+    let wide: Vec<u16> = root.as_os_str().encode_wide().chain([0]).collect();
+    let kind = unsafe { GetDriveTypeW(wide.as_ptr()) };
+    // A failed probe is treated as remote so deduplication stays disabled.
+    (kind != 0).then_some(kind == DRIVE_REMOTE)
 }
 
 fn open_path(path: &Path, access: u32) -> io::Result<OwnedHandle> {
@@ -610,6 +754,40 @@ mod tests {
                 FileName
             )
         );
+    }
+
+    #[test]
+    fn enumerated_directories_carry_the_handle_identity() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clean-identity-{unique}"));
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let scan_root = RootFileSystem::open(&root).unwrap();
+        if !identity_valid(scan_root.metadata.identity) {
+            // FAT/exFAT and network volumes opt out of identity entirely.
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+        let entry = scan_root
+            .open_root()
+            .unwrap()
+            .entries()
+            .unwrap()
+            .find_map(|item| match item {
+                EntryItem::Entry(entry) if entry.name == OsStr::new("child") => Some(entry),
+                _ => None,
+            })
+            .unwrap();
+        let handle = open_path(&child, FILE_ACCESS).unwrap();
+        let info: FILE_ID_INFO = get_info(raw_handle(&handle), FileIdInfo).unwrap();
+        assert_eq!(entry.metadata.identity, identity_from(&info));
+        assert_eq!(entry.metadata.kind, EntryKind::Directory);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
