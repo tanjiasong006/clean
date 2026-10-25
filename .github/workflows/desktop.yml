@@ -1,4 +1,4 @@
-name: macOS checks
+name: Desktop checks
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  macos:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -29,5 +29,28 @@ jobs:
         run: |
           rustc --edition=2024 -D warnings -O scripts/core_perf.rs -o "$RUNNER_TEMP/clean-core-perf"
           "$RUNNER_TEMP/clean-core-perf"
+      - name: Build
+        run: cargo build --locked
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust tooling
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Check formatting
+        run: |
+          cargo fmt --check
+          rustfmt --edition 2024 --check scripts/core_perf.rs
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Core performance smoke
+        run: |
+          rustc --edition=2024 -D warnings -O scripts/core_perf.rs -o "$env:RUNNER_TEMP/clean-core-perf.exe"
+          & "$env:RUNNER_TEMP/clean-core-perf.exe"
       - name: Build
         run: cargo build --locked

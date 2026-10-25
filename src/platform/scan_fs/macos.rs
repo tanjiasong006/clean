@@ -369,10 +369,7 @@ fn parse_entry(fd: BorrowedFd<'_>, group: &[u8]) -> io::Result<DirEntry> {
         metadata: EntryMetadata {
             kind,
             allocated_bytes,
-            identity: FileIdentity {
-                device: device.unwrap_or(0),
-                inode: inode.unwrap_or(0),
-            },
+            identity: FileIdentity::new(device.unwrap_or(0), inode.unwrap_or(0)),
             links: links.unwrap_or(1),
         },
     })
@@ -442,10 +439,7 @@ fn metadata_from_stat(stat: Stat) -> io::Result<EntryMetadata> {
     Ok(EntryMetadata {
         kind,
         allocated_bytes,
-        identity: FileIdentity {
-            device: stat.st_dev as u64,
-            inode: stat.st_ino,
-        },
+        identity: FileIdentity::new(stat.st_dev as u64, stat.st_ino),
         links: stat.st_nlink as u64,
     })
 }

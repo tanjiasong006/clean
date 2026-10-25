@@ -1,7 +1,6 @@
 use std::{
     ffi::OsStr,
     fs,
-    os::unix::fs::MetadataExt,
     sync::{Arc, atomic::AtomicUsize},
 };
 
@@ -94,12 +93,58 @@ impl NodeView<'_> {
     }
 }
 
+#[cfg(unix)]
 fn allocated(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
     fs::symlink_metadata(path)
         .unwrap()
         .blocks()
         .checked_mul(512)
         .unwrap()
+}
+
+#[cfg(windows)]
+fn allocated(path: &Path) -> u64 {
+    crate::platform::scan_fs::windows_allocated_bytes(path).unwrap()
+}
+
+#[cfg(unix)]
+fn link_count(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).unwrap().nlink()
+}
+
+#[cfg(windows)]
+fn link_count(path: &Path) -> u64 {
+    crate::platform::scan_fs::windows_link_count(path).unwrap()
+}
+
+#[cfg(unix)]
+fn symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(unix)]
+fn symlinks_supported() -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn symlinks_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let probe = TempDirectory::new();
+        let target = probe.0.join("target");
+        if fs::create_dir(&target).is_err() {
+            return false;
+        }
+        symlink_dir(&target, &probe.0.join("link")).is_ok()
+    })
 }
 
 fn assert_allocated_totals(results: &ScanResults) {
@@ -390,8 +435,10 @@ fn worker_delivers_bounded_batches_and_flushes_on_cancellation() {
 
 #[test]
 fn queued_directory_replacements_are_incomplete_and_never_read() {
-    use std::os::unix::fs::symlink;
     for replace_with_symlink in [false, true] {
+        if replace_with_symlink && !symlinks_supported() {
+            continue;
+        }
         let temp = TempDirectory::new();
         let external = TempDirectory::new();
         let backup = TempDirectory::new();
@@ -409,7 +456,7 @@ fn queued_directory_replacements_are_incomplete_and_never_read() {
                 if path == target {
                     fs::rename(path, &moved)?;
                     if replace_with_symlink {
-                        symlink(&outside, path)?;
+                        symlink_dir(&outside, path)?;
                     } else {
                         fs::create_dir(path)?;
                         fs::write(path.join("replacement"), [0; 50])?;
@@ -431,7 +478,9 @@ fn queued_directory_replacements_are_incomplete_and_never_read() {
 
 #[test]
 fn replacing_a_queued_ancestor_with_a_symlink_cannot_escape_the_root() {
-    use std::os::unix::fs::symlink;
+    if !symlinks_supported() {
+        return;
+    }
     let temp = TempDirectory::new();
     let external = TempDirectory::new();
     let backup = TempDirectory::new();
@@ -450,7 +499,7 @@ fn replacing_a_queued_ancestor_with_a_symlink_cannot_escape_the_root() {
         before_read: Arc::new(move |path| {
             if path == inner {
                 fs::rename(&outer, &moved)?;
-                symlink(&outside, &outer)?;
+                symlink_dir(&outside, &outer)?;
             }
             Ok(())
         }),
@@ -469,7 +518,9 @@ fn replacing_a_queued_ancestor_with_a_symlink_cannot_escape_the_root() {
 
 #[test]
 fn metadata_stays_relative_to_the_open_directory_after_path_replacement() {
-    use std::os::unix::fs::symlink;
+    if !symlinks_supported() {
+        return;
+    }
     let temp = TempDirectory::new();
     let external = TempDirectory::new();
     let backup = TempDirectory::new();
@@ -483,7 +534,7 @@ fn metadata_stays_relative_to_the_open_directory_after_path_replacement() {
         before_metadata: Arc::new(move |path| {
             if path == original {
                 fs::rename(&directory, &moved)?;
-                symlink(&outside, &directory)?;
+                symlink_dir(&outside, &directory)?;
             }
             Ok(())
         }),
@@ -497,7 +548,9 @@ fn metadata_stays_relative_to_the_open_directory_after_path_replacement() {
 
 #[test]
 fn the_selected_root_is_anchored_even_if_its_path_is_replaced() {
-    use std::os::unix::fs::symlink;
+    if !symlinks_supported() {
+        return;
+    }
     let temp = TempDirectory::new();
     let external = TempDirectory::new();
     let backup = TempDirectory::new();
@@ -513,7 +566,7 @@ fn the_selected_root_is_anchored_even_if_its_path_is_replaced() {
         before_read: Arc::new(move |path| {
             if path == root {
                 fs::rename(path, &moved)?;
-                symlink(&outside, path)?;
+                symlink_dir(&outside, path)?;
             }
             Ok(())
         }),
@@ -527,10 +580,12 @@ fn the_selected_root_is_anchored_even_if_its_path_is_replaced() {
 
 #[test]
 fn symlink_roots_with_trailing_separator_or_dot_are_rejected() {
-    use std::os::unix::fs::symlink;
+    if !symlinks_supported() {
+        return;
+    }
     let temp = TempDirectory::new();
     let external = TempDirectory::new();
-    symlink(&external.0, temp.0.join("link")).unwrap();
+    symlink_dir(&external.0, &temp.0.join("link")).unwrap();
     for suffix in ["link/", "link/."] {
         let results = collect_real(&temp.0.join(suffix));
         assert_eq!(results.state, ScanState::Failed);
@@ -700,7 +755,7 @@ fn a_terabyte_sparse_image_is_charged_only_its_allocated_blocks() {
         .set_len(logical_bytes)
         .unwrap();
     let metadata = fs::symlink_metadata(&image).unwrap();
-    let allocated_bytes = metadata.blocks().checked_mul(512).unwrap();
+    let allocated_bytes = allocated(&image);
     let results = collect_real(&temp.0);
     assert_eq!(results.state, ScanState::Complete);
     assert_eq!(results.files, 1);
@@ -710,7 +765,7 @@ fn a_terabyte_sparse_image_is_charged_only_its_allocated_blocks() {
     assert!(metadata.len() > 512_000_000_000);
     assert!(results.bytes(0) < 512_000_000_000);
     assert!(allocated_bytes < logical_bytes);
-    assert_eq!(metadata.nlink(), 1);
+    assert_eq!(link_count(&image), 1);
     assert!(results.issues.is_empty());
 }
 
@@ -748,12 +803,14 @@ fn matching_inodes_on_different_devices_are_not_deduplicated() {
     let fs = TestFileSystem {
         metadata_override: Arc::new(|path, mut metadata| {
             if metadata.kind == EntryKind::File {
-                metadata.identity.inode = 42;
-                metadata.identity.device = if path.file_name().unwrap() == "a" {
-                    1
-                } else {
-                    2
-                };
+                metadata.identity = FileIdentity::new(
+                    if path.file_name().unwrap() == "a" {
+                        1
+                    } else {
+                        2
+                    },
+                    42,
+                );
             }
             metadata
         }),

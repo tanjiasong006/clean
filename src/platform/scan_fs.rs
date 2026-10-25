@@ -12,10 +12,43 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::RootFileSystem;
 
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(any(target_os = "windows", test))]
+mod windows_records;
+#[cfg(target_os = "windows")]
+pub use windows::RootFileSystem;
+#[cfg(all(target_os = "windows", test))]
+pub use windows::allocated_bytes as windows_allocated_bytes;
+#[cfg(all(target_os = "windows", test))]
+pub use windows::link_count as windows_link_count;
+
+/// A file's stable identity within one scan. The scanner only requires that
+/// equal identities mean the same file; it never reads the fields.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
     pub device: u64,
     pub inode: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    pub volume: u64,
+    pub file_id: u128,
+}
+
+impl FileIdentity {
+    #[cfg(unix)]
+    pub fn new(device: u64, inode: u64) -> Self {
+        Self { device, inode }
+    }
+
+    #[cfg(windows)]
+    pub fn new(volume: u64, file_id: u128) -> Self {
+        Self { volume, file_id }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -23,8 +56,8 @@ pub struct EntryMetadata {
     pub kind: EntryKind,
     pub allocated_bytes: u64,
     pub identity: FileIdentity,
-    /// Hard-link count from `st_nlink`. A file with a single link can never be
-    /// an alias, so the scanner keeps it out of the deduplication table.
+    /// Whether the file may be a hard-link alias, expressed as a link count.
+    /// A value of one keeps the file out of the deduplication table.
     pub links: u64,
 }
 
@@ -62,10 +95,10 @@ pub trait FileSystem: Send + Sync {
     fn open_root(&self) -> io::Result<Box<dyn Directory>>;
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub struct RootFileSystem;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl RootFileSystem {
     pub fn open(_: &std::path::Path) -> io::Result<Self> {
         Err(io::Error::new(
@@ -75,7 +108,7 @@ impl RootFileSystem {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl FileSystem for RootFileSystem {
     fn root_metadata(&self) -> EntryMetadata {
         unreachable!("unsupported platforms cannot open a scan root")
