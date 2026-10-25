@@ -448,10 +448,8 @@ fn hard_link_aliases_are_indexed_in_node_order_across_batches() {
 
 #[test]
 fn nodes_store_names_in_chunks_and_reconstruct_exact_paths() {
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
-
     let root = PathBuf::from("/root/long/shared/prefix/");
-    let name = OsString::from_vec(b"file-\xff".to_vec());
+    let name = non_utf8_name("file-");
     let expected = [
         root.clone(),
         root.join("nested"),
@@ -486,14 +484,14 @@ fn nodes_store_names_in_chunks_and_reconstruct_exact_paths() {
 
 #[test]
 fn path_order_matches_filesystem_order_across_ancestors_and_trees() {
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    use std::ffi::OsString;
 
     let names = [
         OsString::from("a"),
         OsString::from("a-"),
         OsString::from("z"),
         OsString::from("中文"),
-        OsString::from_vec(b"non-utf8-\xff".to_vec()),
+        non_utf8_name("non-utf8-"),
     ];
     let mut results = ScanResults::default();
     let root = PathBuf::from("/root/./shared/");
@@ -610,10 +608,10 @@ fn repeated_names_share_one_dictionary_entry() {
 
 #[test]
 fn long_names_intern_exactly_across_the_length_byte_boundary() {
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    use std::ffi::OsString;
 
-    let boundary = OsString::from_vec(vec![b'y'; 255]);
-    let longer = OsString::from_vec((0..300).map(|index| b'a' + index as u8 % 26).collect());
+    let boundary = OsString::from("y".repeat(255));
+    let longer = OsString::from("abcdefghijklmnopqrstuvwxyz".repeat(12));
     let mut results = ScanResults::default();
     results.apply_batch([
         ScanEvent::Entry {
@@ -708,4 +706,85 @@ fn files_above_the_inline_block_limit_keep_their_exact_size() {
 fn directory_records_stay_small() {
     assert_eq!(std::mem::size_of::<DirectoryData>(), 24);
     assert_eq!(std::mem::size_of::<Node>(), 6);
+}
+
+/// A name that is not valid UTF-8 (Unix) or contains a lone surrogate
+/// (Windows), so the dictionary must preserve it exactly.
+#[cfg(unix)]
+fn non_utf8_name(prefix: &str) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let mut bytes = prefix.as_bytes().to_vec();
+    bytes.push(0xFF);
+    OsString::from_vec(bytes)
+}
+
+#[cfg(windows)]
+fn non_utf8_name(prefix: &str) -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+    let mut units: Vec<u16> = prefix.encode_utf16().collect();
+    units.push(0xD800);
+    OsString::from_wide(&units)
+}
+
+#[test]
+fn wtf8_round_trips_bmp_astral_and_lone_surrogates() {
+    let cases: Vec<Vec<u16>> = vec![
+        "plain ASCII".encode_utf16().collect(),
+        "中文 😀".encode_utf16().collect(),
+        vec![0xD800],
+        vec![0xDC00],
+        vec![0x0061, 0xD800, 0x0062],
+        vec![0xD83D, 0xDE00],
+        vec![0xFFFF],
+        vec![0x0079; 255],
+    ];
+    for units in cases {
+        let bytes = wtf8_from_wide(&units);
+        assert_eq!(
+            wtf8_to_wide(&bytes).as_deref(),
+            Some(&units[..]),
+            "{units:?}"
+        );
+        if units.iter().all(|unit| *unit < 0x80) {
+            assert_eq!(bytes.len(), units.len());
+        }
+    }
+}
+
+#[test]
+fn wtf8_rejects_malformed_sequences() {
+    let malformed = [
+        vec![0x80],
+        vec![0xC0, 0x80],
+        vec![0xC2],
+        vec![0xE0, 0x80, 0x80],
+        vec![0xE0, 0xA0],
+        vec![0xED, 0x00],
+        vec![0xF0, 0x80, 0x80, 0x80],
+        vec![0xF4, 0x90, 0x80, 0x80],
+        vec![0xF5, 0x80, 0x80, 0x80],
+        vec![0xF0, 0x9F, 0x98],
+    ];
+    for bytes in malformed {
+        assert!(wtf8_to_wide(&bytes).is_none(), "{bytes:?}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_names_round_trip_including_lone_surrogates() {
+    use std::os::windows::ffi::OsStringExt;
+    let name = OsString::from_wide(&[0x66, 0x6F, 0x6F, 0xD800, 0x2E, 0x74, 0x78, 0x74]);
+    let bytes = os_bytes(&name).into_owned();
+    assert_eq!(os_string_from_bytes(bytes), name);
+
+    let mut results = ScanResults::default();
+    results.apply(ScanEvent::Entry {
+        path: PathBuf::from(r"C:\root").join(&name),
+        parent: None,
+        kind: EntryKind::File,
+        bytes: 512,
+        hard_link_to: None,
+    });
+    assert_eq!(results.to_path_buf(0).file_name(), Some(name.as_os_str()));
 }

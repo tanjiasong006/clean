@@ -355,7 +355,7 @@ impl NameDict {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn os_bytes(name: &OsStr) -> Cow<'_, [u8]> {
     match name.to_str() {
         Some(text) => Cow::Borrowed(text.as_bytes()),
@@ -368,7 +368,18 @@ fn os_bytes(name: &OsStr) -> Cow<'_, [u8]> {
     Cow::Borrowed(name.as_bytes())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn os_bytes(name: &OsStr) -> Cow<'_, [u8]> {
+    use std::os::windows::ffi::OsStrExt;
+    // Valid Unicode is already valid WTF-8, so the common path borrows the
+    // UTF-8 bytes. Names with lone surrogates take the lossless wide path.
+    match name.to_str() {
+        Some(text) => Cow::Borrowed(text.as_bytes()),
+        None => Cow::Owned(wtf8_from_wide(&name.encode_wide().collect::<Vec<_>>())),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn os_string_from_bytes(bytes: Vec<u8>) -> OsString {
     OsString::from(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -376,6 +387,126 @@ fn os_string_from_bytes(bytes: Vec<u8>) -> OsString {
 #[cfg(unix)]
 fn os_string_from_bytes(bytes: Vec<u8>) -> OsString {
     OsString::from_vec(bytes)
+}
+
+#[cfg(windows)]
+fn os_string_from_bytes(bytes: Vec<u8>) -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+    match String::from_utf8(bytes) {
+        Ok(text) => OsString::from(text),
+        Err(error) => {
+            let bytes = error.into_bytes();
+            match wtf8_to_wide(&bytes) {
+                Some(units) => OsString::from_wide(&units),
+                None => OsString::from(String::from_utf8_lossy(&bytes).into_owned()),
+            }
+        }
+    }
+}
+
+/// Encodes UTF-16 as WTF-8: valid scalar values use UTF-8, and unpaired
+/// surrogates use ordinary three-byte sequences so they survive a round trip.
+#[cfg(any(windows, test))]
+fn wtf8_from_wide(units: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(units.len() * 3);
+    let mut index = 0;
+    while index < units.len() {
+        let unit = units[index];
+        let code = if (0xD800..=0xDBFF).contains(&unit)
+            && units
+                .get(index + 1)
+                .is_some_and(|next| (0xDC00..=0xDFFF).contains(next))
+        {
+            let low = units[index + 1];
+            index += 2;
+            0x10000 + (((unit as u32 - 0xD800) << 10) | (low as u32 - 0xDC00))
+        } else {
+            index += 1;
+            unit as u32
+        };
+        push_utf8(&mut bytes, code);
+    }
+    bytes
+}
+
+#[cfg(any(windows, test))]
+fn push_utf8(bytes: &mut Vec<u8>, code: u32) {
+    if code < 0x80 {
+        bytes.push(code as u8);
+    } else if code < 0x800 {
+        bytes.push(0xC0 | (code >> 6) as u8);
+        bytes.push(0x80 | (code & 0x3F) as u8);
+    } else if code < 0x10000 {
+        bytes.push(0xE0 | (code >> 12) as u8);
+        bytes.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        bytes.push(0x80 | (code & 0x3F) as u8);
+    } else {
+        bytes.push(0xF0 | (code >> 18) as u8);
+        bytes.push(0x80 | ((code >> 12) & 0x3F) as u8);
+        bytes.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        bytes.push(0x80 | (code & 0x3F) as u8);
+    }
+}
+
+/// Decodes WTF-8 back to UTF-16. Rejects overlong forms, truncated sequences,
+/// invalid continuation bytes, and scalar values above U+10FFFF.
+#[cfg(any(windows, test))]
+fn wtf8_to_wide(bytes: &[u8]) -> Option<Vec<u16>> {
+    let mut units = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let first = bytes[index];
+        let (code, length) = match first {
+            0x00..=0x7F => (u32::from(first), 1),
+            0xC2..=0xDF => {
+                let second = *bytes.get(index + 1)?;
+                if second & 0xC0 != 0x80 {
+                    return None;
+                }
+                ((u32::from(first & 0x1F) << 6) | u32::from(second & 0x3F), 2)
+            }
+            0xE0..=0xEF => {
+                let second = *bytes.get(index + 1)?;
+                let third = *bytes.get(index + 2)?;
+                if second & 0xC0 != 0x80 || third & 0xC0 != 0x80 {
+                    return None;
+                }
+                let code = (u32::from(first & 0x0F) << 12)
+                    | (u32::from(second & 0x3F) << 6)
+                    | u32::from(third & 0x3F);
+                if code < 0x800 {
+                    return None;
+                }
+                (code, 3)
+            }
+            0xF0..=0xF4 => {
+                let second = *bytes.get(index + 1)?;
+                let third = *bytes.get(index + 2)?;
+                let fourth = *bytes.get(index + 3)?;
+                if second & 0xC0 != 0x80 || third & 0xC0 != 0x80 || fourth & 0xC0 != 0x80 {
+                    return None;
+                }
+                let code = (u32::from(first & 0x07) << 18)
+                    | (u32::from(second & 0x3F) << 12)
+                    | (u32::from(third & 0x3F) << 6)
+                    | u32::from(fourth & 0x3F);
+                if !(0x10000..=0x10FFFF).contains(&code) {
+                    return None;
+                }
+                (code, 4)
+            }
+            _ => return None,
+        };
+        if code <= 0xFFFF {
+            units.push(code as u16);
+        } else {
+            let value = code - 0x10000;
+            units.push(0xD800 + (value >> 10) as u16);
+            units.push(0xDC00 + (value & 0x3FF) as u16);
+        }
+        index += length;
+    }
+    Some(units)
 }
 
 /// A node's name, borrowed from the shared name dictionary unless it spans
