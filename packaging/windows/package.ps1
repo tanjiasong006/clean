@@ -8,7 +8,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) {
+$makensis = Get-Command makensis.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+$makensisPath = $null
+if ($makensis) {
+    $makensisPath = $makensis.Source
+} else {
+    $candidates = @()
+    if (${env:ProgramFiles(x86)}) { $candidates += Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe" }
+    if ($env:ProgramFiles) { $candidates += Join-Path $env:ProgramFiles "NSIS\makensis.exe" }
+    $makensisPath = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if (-not $makensisPath) {
     throw "makensis.exe was not found. Install NSIS and add it to PATH."
 }
 
@@ -27,7 +37,7 @@ $scriptPath = (Resolve-Path "packaging\windows\clean.nsi").Path
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $outPath = Join-Path (Resolve-Path $OutDir).Path "Clean-${Version}-windows-x86_64-setup.exe"
 
-& makensis.exe `
+& $makensisPath `
     "/DAPP_VERSION=$Version" `
     "/DAPP_VERSION_4=$version4" `
     "/DAPP_BINARY=$binaryPath" `
