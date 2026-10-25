@@ -163,6 +163,9 @@ impl Directory for WinDirectory {
 
     fn open_child(&self, name: &OsStr, expected: FileIdentity) -> io::Result<Box<dyn Directory>> {
         validate_name(name)?;
+        // Windows rejects FILE_OPEN_NO_RECALL together with
+        // FILE_DIRECTORY_FILE; the reparse-point flag already prevents
+        // following a link or hydrating a placeholder directory.
         let child = nt_open(
             raw_handle(&self.handle),
             name,
@@ -170,7 +173,6 @@ impl Directory for WinDirectory {
             FILE_DIRECTORY_FILE
                 | FILE_OPEN_REPARSE_POINT
                 | FILE_OPEN_FOR_BACKUP_INTENT
-                | FILE_OPEN_NO_RECALL
                 | FILE_SYNCHRONOUS_IO_NONALERT,
         )?;
         let attributes: FILE_ATTRIBUTE_TAG_INFO =
