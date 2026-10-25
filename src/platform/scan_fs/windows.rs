@@ -18,7 +18,8 @@ use windows_sys::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
             FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
-            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+            FILE_OPEN_NO_RECALL, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+            NtCreateFile,
         },
     },
     Win32::{
@@ -183,6 +184,7 @@ impl Directory for WinDirectory {
             FILE_DIRECTORY_FILE
                 | FILE_OPEN_REPARSE_POINT
                 | FILE_OPEN_FOR_BACKUP_INTENT
+                | FILE_OPEN_NO_RECALL
                 | FILE_SYNCHRONOUS_IO_NONALERT,
         )?;
         let attributes: FILE_ATTRIBUTE_TAG_INFO =
@@ -408,7 +410,10 @@ fn probe_link_count(parent: HANDLE, name: &OsStr) -> io::Result<u64> {
         parent,
         name,
         FILE_ACCESS,
-        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        FILE_NON_DIRECTORY_FILE
+            | FILE_OPEN_REPARSE_POINT
+            | FILE_OPEN_NO_RECALL
+            | FILE_SYNCHRONOUS_IO_NONALERT,
     )?;
     let standard: FILE_STANDARD_INFO = get_info(raw_handle(&child), FileStandardInfo)?;
     Ok(u64::from(standard.NumberOfLinks.max(1)))
