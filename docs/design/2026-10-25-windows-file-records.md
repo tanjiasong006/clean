@@ -170,6 +170,7 @@ NTFS 对目录报告的 AllocationSize 通常为 0。接受文件系统返回值
 - **D7**：方案 A 未改变内存模型；Windows 实机峰值未测。
 - **枚举 API 偏差**：条目枚举使用 `GetFileInformationByHandleEx(FileIdExtdDirectoryInfo / FileIdExtdDirectoryRestartInfo)`，而非 `NtQueryDirectoryFile`。两者读取同一个信息类，前者是 Win32 封装且减少 NTSTATUS 处理；目录打开仍使用 `NtCreateFile`。
 - **枚举回退**：首次读取若返回 `ERROR_INVALID_FUNCTION`、`ERROR_INVALID_LEVEL`、`ERROR_NOT_SUPPORTED` 或 `ERROR_INVALID_PARAMETER`，从目录开头改用 `FileIdBothDirectoryInfo / FileIdBothDirectoryRestartInfo` 重读。该布局无 128 位 ID 与重解析标签：条目 `links = 1`、不参与去重，仅重解析点条目额外按名称打开读取标签。回退按目录独立生效。缓冲区为 64 KiB（单条记录最大约 0.6 KiB），避免部分 SMB 服务器对更大缓冲区的拒绝。`FILE_ID_BOTH_DIR_INFO` 的 64 位布局为：`AllocationSize` 48、`FileAttributes` 56、`FileNameLength` 60、`FileName` 104；Windows 测试用 `offset_of!` 与 `windows-sys` 定义比对。
+- **目录相对打开**：`FILE_OPEN_NO_RECALL` 与 `FILE_DIRECTORY_FILE` 同时使用会被 Windows 以 `STATUS_INVALID_PARAMETER` 拒绝（Wine 不检查）。打开子目录时只保留 `FILE_OPEN_REPARSE_POINT` 与 `FILE_OPEN_FOR_BACKUP_INTENT`；文件探测仍带 `FILE_OPEN_NO_RECALL`，避免云占位符下载内容。
 - **根目录校验与锚定**：先用 `FILE_READ_ATTRIBUTES` 打开并拒绝非目录与重解析点，再以列目录权限按路径打开并复核 FileId。`ReOpenFile` 在 Wine 上请求更高权限会返回拒绝访问，可能按路径重新解析，因此扫描根改用 `DuplicateHandle` 复制已打开的句柄：复制保留原文件对象，根目录被重命名或替换后仍读取原目录，也不存在路径与打开之间的竞态。
 - **测试与 CI**：纯缓冲区解析和重解析点分类抽到平台无关模块，可在任意主机运行；Windows job 执行 fmt、Clippy、test、build（含 release）与 core_perf。真实文件系统用例在 Windows CI 上运行，符号链接用例在权限不足时跳过。在 macOS 上另可用 cargo-xwin 交叉链接测试程序并在 Wine 中执行：2026-10-25 实测 82 个用例通过、2 个默认忽略；Wine 不实现 `FileIdExtdDirectoryInfo`，依赖身份的用例按检测结果跳过，且其 DXGI 无法初始化，界面仍需 Windows 实机或 CI 验证。
 
