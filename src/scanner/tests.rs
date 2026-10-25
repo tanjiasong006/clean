@@ -130,6 +130,17 @@ fn symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn mark_sparse(_: &fs::File) -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn mark_sparse(file: &fs::File) -> bool {
+    // Without sparse support, extending to the test length would allocate it.
+    crate::platform::scan_fs::windows_mark_sparse(file).is_ok()
+}
+
+#[cfg(unix)]
 fn symlinks_supported() -> bool {
     true
 }
@@ -653,6 +664,9 @@ fn sparse_files_keep_only_written_blocks_and_their_exact_path() {
     let path = temp.0.join("Unicode 空格 'quotes'\n.bin");
     use std::io::{Seek, SeekFrom, Write};
     let mut file = fs::File::create(&path).unwrap();
+    if !mark_sparse(&file) {
+        return;
+    }
     file.set_len(5 * 1024 * 1024 * 1024).unwrap();
     file.write_all(&[1; 4096]).unwrap();
     file.seek(SeekFrom::End(-4096)).unwrap();
@@ -750,10 +764,11 @@ fn a_terabyte_sparse_image_is_charged_only_its_allocated_blocks() {
     let image = temp.0.join("virtual-disk.raw");
     let logical_bytes = 1024_u64.pow(4);
     // set_len creates holes; this test does not write or allocate a TiB of data.
-    fs::File::create(&image)
-        .unwrap()
-        .set_len(logical_bytes)
-        .unwrap();
+    let image_file = fs::File::create(&image).unwrap();
+    if !mark_sparse(&image_file) {
+        return;
+    }
+    image_file.set_len(logical_bytes).unwrap();
     let metadata = fs::symlink_metadata(&image).unwrap();
     let allocated_bytes = allocated(&image);
     let results = collect_real(&temp.0);

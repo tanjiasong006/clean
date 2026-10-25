@@ -22,6 +22,8 @@ pub use windows::RootFileSystem;
 pub use windows::allocated_bytes as windows_allocated_bytes;
 #[cfg(all(target_os = "windows", test))]
 pub use windows::link_count as windows_link_count;
+#[cfg(all(target_os = "windows", test))]
+pub use windows::mark_sparse as windows_mark_sparse;
 
 /// A file's stable identity within one scan. The scanner only requires that
 /// equal identities mean the same file; it never reads the fields.

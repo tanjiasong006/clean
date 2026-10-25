@@ -57,6 +57,11 @@ const OPEN_FLAGS: u32 = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POIN
 /// the 88-byte header plus a 255-unit name, so 256 KiB never splits one.
 const BUFFER_SIZE: usize = 256 * 1024;
 
+/// `FSCTL_SET_SPARSE` from `winioctl.h`; marking a file sparse before
+/// extending it keeps tests from allocating their full logical length.
+#[cfg(test)]
+const FSCTL_SET_SPARSE: u32 = 590_020;
+
 pub struct RootFileSystem {
     handle: OwnedHandle,
     path: PathBuf,
@@ -428,6 +433,33 @@ pub fn allocated_bytes(path: &Path) -> io::Result<u64> {
     let handle = open_path(&path, FILE_ACCESS)?;
     let standard: FILE_STANDARD_INFO = get_info(raw_handle(&handle), FileStandardInfo)?;
     allocation(standard.AllocationSize)
+}
+
+/// Marks an open file sparse so extending it does not allocate clusters.
+#[cfg(test)]
+pub fn mark_sparse(file: &std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    let mut returned = 0;
+    // SAFETY: the handle is open, no input or output buffers are required for
+    // this control code, and `returned` is a live out-pointer.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as HANDLE,
+            FSCTL_SET_SPARSE,
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Link count reported by the filesystem for one path.
