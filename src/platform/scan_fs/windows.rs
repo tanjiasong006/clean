@@ -24,10 +24,10 @@ use windows_sys::{
     },
     Win32::{
         Foundation::{
-            ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
-            ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, STATUS_ACCESS_DENIED,
-            STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-            STATUS_SHARING_VIOLATION, UNICODE_STRING,
+            ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER,
+            ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
+            STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
+            STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION, UNICODE_STRING,
         },
         Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -48,7 +48,7 @@ use super::windows_records::RECORD_HEADER_SIZE;
 use super::windows_records::{classify, parse, parse_both};
 use super::{DirEntry, Directory, EntryError, EntryItem, EntryMetadata, FileIdentity, FileSystem};
 use crate::models::EntryKind;
-use crate::platform::volume_root;
+use crate::platform::volume_path;
 
 const DIRECTORY_ACCESS: u32 = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const FILE_ACCESS: u32 = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
@@ -56,8 +56,9 @@ const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 const OPEN_FLAGS: u32 = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
 
 /// Bulk reads amortize one syscall over many entries. A single entry is at most
-/// the 88-byte header plus a 255-unit name, so 256 KiB never splits one.
-const BUFFER_SIZE: usize = 256 * 1024;
+/// the 104-byte header plus a 255-unit name, so 64 KiB never splits one and
+/// stays under the 64 KiB limit some SMB servers enforce for this call.
+const BUFFER_SIZE: usize = 64 * 1024;
 
 /// `DRIVE_REMOTE` from `winbase.h`; `GetDriveTypeW` reports it for both mapped
 /// drives and UNC shares.
@@ -477,12 +478,13 @@ fn unsupported_directory_class(error: &io::Error) -> bool {
         Some(code)
             if code == ERROR_INVALID_FUNCTION as i32
                 || code == ERROR_NOT_SUPPORTED as i32
+                || code == ERROR_INVALID_LEVEL as i32
                 || code == ERROR_INVALID_PARAMETER as i32
     )
 }
 
 fn volume_is_remote(path: &Path) -> Option<bool> {
-    let root = volume_root(path);
+    let root = volume_path(path);
     let wide: Vec<u16> = root.as_os_str().encode_wide().chain([0]).collect();
     let kind = unsafe { GetDriveTypeW(wide.as_ptr()) };
     // A failed probe is treated as remote so deduplication stays disabled.
@@ -651,7 +653,7 @@ fn supports_file_ids(filesystem: &str) -> bool {
 }
 
 fn volume_filesystem(path: &Path) -> Option<String> {
-    let root = volume_root(path);
+    let root = volume_path(path);
     let wide: Vec<u16> = root.as_os_str().encode_wide().chain([0]).collect();
     let mut name = [0u16; 32];
     let ok = unsafe {
@@ -788,6 +790,33 @@ mod tests {
         assert_eq!(entry.metadata.identity, identity_from(&info));
         assert_eq!(entry.metadata.kind, EntryKind::Directory);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fallback_record_layout_matches_the_windows_structure() {
+        use std::mem::offset_of;
+
+        use super::super::windows_records::{
+            BOTH_ALLOCATION_SIZE, BOTH_ATTRIBUTES, BOTH_FILE_NAME_LENGTH, BOTH_RECORD_HEADER_SIZE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ID_BOTH_DIR_INFO;
+
+        assert_eq!(
+            BOTH_RECORD_HEADER_SIZE,
+            offset_of!(FILE_ID_BOTH_DIR_INFO, FileName)
+        );
+        assert_eq!(
+            BOTH_ALLOCATION_SIZE,
+            offset_of!(FILE_ID_BOTH_DIR_INFO, AllocationSize)
+        );
+        assert_eq!(
+            BOTH_ATTRIBUTES,
+            offset_of!(FILE_ID_BOTH_DIR_INFO, FileAttributes)
+        );
+        assert_eq!(
+            BOTH_FILE_NAME_LENGTH,
+            offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength)
+        );
     }
 
     #[test]

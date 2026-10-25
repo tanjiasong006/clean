@@ -12,7 +12,7 @@ use std::{
 
 use windows_sys::Win32::{
     Foundation::HANDLE,
-    Storage::FileSystem::GetDiskFreeSpaceExW,
+    Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumePathNameW},
     System::Com::CoTaskMemFree,
     UI::Shell::{FOLDERID_Downloads, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
 };
@@ -21,7 +21,7 @@ use crate::models::DiskSpace;
 
 pub fn disk_space(path: &Path) -> io::Result<DiskSpace> {
     let path = std::path::absolute(path)?;
-    let root = volume_root(&path);
+    let root = volume_path(&path);
     let wide = wide_null(root.as_os_str())?;
     let mut available = 0_u64;
     let mut capacity = 0_u64;
@@ -109,7 +109,28 @@ fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
     (!path.as_os_str().is_empty()).then_some(path)
 }
 
-pub(crate) fn volume_root(path: &Path) -> PathBuf {
+/// The volume mount point that contains `path`. Unlike reducing the path to its
+/// drive prefix, this resolves volumes mounted into a folder, so capacity and
+/// filesystem queries describe the volume that actually holds the path.
+pub(crate) fn volume_path(path: &Path) -> PathBuf {
+    let Ok(wide) = wide_null(path.as_os_str()) else {
+        return volume_root(path);
+    };
+    let mut buffer = vec![0_u16; 32_768];
+    // SAFETY: `wide` is NUL-terminated and `buffer` is a live, writable
+    // allocation whose length is passed exactly.
+    let ok = unsafe { GetVolumePathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+    if ok == 0 {
+        return volume_root(path);
+    }
+    let length = buffer.iter().position(|&unit| unit == 0).unwrap_or(0);
+    if length == 0 {
+        return volume_root(path);
+    }
+    PathBuf::from(OsString::from_wide(&buffer[..length]))
+}
+
+fn volume_root(path: &Path) -> PathBuf {
     let mut components = path.components();
     if let Some(Component::Prefix(prefix)) = components.next() {
         match prefix.kind() {
@@ -167,6 +188,12 @@ mod tests {
             volume_root(Path::new(r"\\server\share\folder")),
             PathBuf::from(r"\\server\share\")
         );
+    }
+
+    #[test]
+    fn volume_path_returns_the_drive_root() {
+        let root = volume_path(Path::new(r"C:\Windows"));
+        assert_eq!(root, PathBuf::from(r"C:\"));
     }
 
     #[test]
