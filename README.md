@@ -41,6 +41,7 @@ Windows 扫描同样以打开的目录句柄为锚点：子目录按单个名称
 - macOS 15 或更高版本，或 Windows 10/11。
 - Rust stable，包含 Cargo、rustfmt 和 Clippy；工具链要求见 `rust-toolchain.toml`。
 - macOS 需要 Xcode 或 Xcode Command Line Tools，使用 `xcode-select -p` 检查开发工具路径；Windows 需要 MSVC 生成工具（Visual Studio Build Tools 中的“使用 C++ 的桌面开发”）。
+- Windows 的 release 构建需要 Windows SDK 中的 `fxc.exe` 编译 GPUI 的 HLSL 着色器；安装上述 MSVC 生成工具时通常已包含。debug 构建跳过着色器编译，因此在 macOS 上只能交叉构建 Windows debug 版本。
 
 GPUI Kit 使用统一依赖入口，包含匹配的 GPUI、组件和默认图标资源。参考[官方安装说明](https://gpui-kit.com/docs/installation/)及[入门文档](https://gpui-kit.com/docs/getting-started/)。
 
