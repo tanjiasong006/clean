@@ -80,8 +80,10 @@ pub fn parse(buffer: &[u8], start: usize) -> io::Result<Record> {
     }
 
     let name_units = buffer[text_start..text_end]
-        .chunks_exact(2)
-        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_ne_bytes(*pair))
         .collect::<Vec<_>>();
     let is_dot = name_units == [b'.' as u16] || name_units == [b'.' as u16, b'.' as u16];
     Ok(Record {
@@ -120,8 +122,10 @@ pub fn parse_both(buffer: &[u8], start: usize) -> io::Result<BothRecord> {
         return Err(malformed("目录条目偏移超出缓冲区。"));
     }
     let name_units = buffer[text_start..text_end]
-        .chunks_exact(2)
-        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_ne_bytes(*pair))
         .collect::<Vec<_>>();
     let is_dot = name_units == [b'.' as u16] || name_units == [b'.' as u16, b'.' as u16];
     Ok(BothRecord {
