@@ -268,7 +268,11 @@ fn hard_link_aliases_show_their_owner_instead_of_misleading_zero_bytes() {
     assert_eq!(view.results.files, 4);
     assert_eq!(view.results.hard_links, 1);
     assert_eq!(view.entry_size(5), "已去重");
-    assert_eq!(view.entry_description(5), "硬链接 · 已计入 /root/top");
+    let owner = std::path::Path::new("/root").join("top");
+    assert_eq!(
+        view.entry_description(5),
+        format!("硬链接 · 已计入 {}", owner.display())
+    );
     view.navigate_to(1, false);
     assert_eq!(visible(&view), vec![4, 5]);
     view.views.entry(1).or_default().selected = Some(5);
@@ -335,7 +339,8 @@ fn hard_link_aliases_never_claim_a_share_and_keep_their_owner_explanation() {
     }]);
     view.navigate_to(1, false);
     assert_eq!(view.share_label(5), "已去重");
-    assert!(view.explanation(5).contains("/root/top"));
+    let owner = std::path::Path::new("/root").join("top");
+    assert!(view.explanation(5).contains(&*owner.to_string_lossy()));
     assert!(view.explanation(5).contains("不重复统计"));
 }
 
