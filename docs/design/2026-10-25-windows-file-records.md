@@ -1,7 +1,7 @@
 # Windows 单文件记录决策与迁移计划
 
 - 日期：2026-10-25
-- 状态：提议（尚未实施）
+- 状态：已实施（2026-10-25）；Windows 实机基准待补
 - 范围：扫描结果中的单个普通文件——身份、硬链接、名称、分配量、重解析点。
 - 不包含：目录聚合、界面、大文件索引策略、Windows 打包。
 
@@ -158,6 +158,19 @@ NTFS 对目录报告的 AllocationSize 通常为 0。接受文件系统返回值
 ### M6. 文档与实机验收（约 0.5-1 天）
 
 更新 README/AGENTS 的平台差异：硬链接探测、目录分配量为 0、挂载点不跨卷、云占位符、名称编码；补 Windows 性能记录。
+
+## 实施记录与偏差
+
+- **D1**：已按平台拆分 `FileIdentity`，两端均提供 `new` 构造函数；macOS 键仍为 16 字节。
+- **D2**：已实现方案 A。`NtCreateFile` 相对父句柄打开每个有有效身份的文件，`GetFileInformationByHandleEx(FileStandardInfo)` 读取 `NumberOfLinks`；探测失败按 1 处理。100 万文件基准尚未在 Windows 实机执行，暂不触发方案 B 的切换门槛。
+- **D3**：仅 `NTFS` 与 `ReFS` 启用文件 ID 去重；其他文件系统、卷序列号为 0 或 FileId 全零时 `links = 1`，不合并文件。FAT/exFAT 未使用路径哈希伪造身份。
+- **D4**：目录重解析点一律不遍历；符号链接与目录联接记为 `Symlink`，其他目录标签记为 `Other`；文件符号链接记为 `Symlink`，其他文件重解析标签（含云占位符）按 `File` 计入分配量。Windows 首版不跨卷。
+- **D5**：接受 `FILE_ID_EXTD_DIR_INFO.AllocationSize`，NTFS 目录通常为 0。
+- **D6**：已实现 WTF-8 编解码，含孤立代理项与 255 单元长名往返测试；展示仍可 lossy。
+- **D7**：方案 A 未改变内存模型；Windows 实机峰值未测。
+- **枚举 API 偏差**：条目枚举使用 `GetFileInformationByHandleEx(FileIdExtdDirectoryInfo / FileIdExtdDirectoryRestartInfo)`，而非 `NtQueryDirectoryFile`。两者读取同一个信息类，前者是 Win32 封装且减少 NTSTATUS 处理；目录打开仍使用 `NtCreateFile`。
+- **根目录重开**：优先 `ReOpenFile` 保持句柄锚定；失败时按原路径重新打开并校验 FileId 与重解析属性。
+- **测试与 CI**：纯缓冲区解析和重解析点分类抽到平台无关模块，可在任意主机运行；Windows job 执行 fmt、Clippy、test、build 与 core_perf。真实文件系统用例在 Windows CI 上运行，符号链接用例在权限不足时跳过。
 
 ## 回滚与兼容
 
