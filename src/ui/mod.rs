@@ -1440,7 +1440,7 @@ impl AppView {
                     .with_size(Size::Small)
                     .icon(IconName::ChevronLeft)
                     .ghost()
-                    .tooltip("返回 (⌫)")
+                    .tooltip(format!("返回 ({})", platform::BACK_SHORTCUT))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(id) = this.history.pop() {
                             this.navigate_to(id, false);
